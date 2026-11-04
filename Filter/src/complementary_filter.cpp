@@ -57,6 +57,16 @@ public:
   // return_type::critical: execution stops
   return_type load_data(json const &input, string topic = "", vector<unsigned char> const *blob = nullptr) override {
     // Do something with the input data
+    if (topic == "driver") {
+      if (input.contains("encoders")) {
+        _prev_enc_count_left = _current_enc_count_left;
+        _prev_enc_count_right = _current_enc_count_right;
+        _current_enc_count_left = input["encoders"].value("left", 0);
+        _current_enc_count_right = input["encoders"].value("right", 0);
+        return return_type::success;
+      }
+    }
+    
     return return_type::success;
   }
 
@@ -112,7 +122,10 @@ public:
 
 private:
   // Define the fields that are used to store internal resources
-  
+  int _prev_enc_count_left = 0;
+  int _prev_enc_count_right = 0;
+  int _current_enc_count_left = 0;
+  int _current_enc_count_right = 0;
 };
 
 
