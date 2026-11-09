@@ -81,7 +81,7 @@ public:
     // --- Driver Message ---
     if (topic == "driver") {
       if (!input.contains("encoders")) {
-        _error = "Driver message without 'encoder' field";
+        _error = "Driver message without 'encoders' field";
         return return_type::error;
       }
       if (!input.contains("timestamp")) {
@@ -89,7 +89,7 @@ public:
         return return_type::error;
       }
 
-      // Updating time and encoder counts
+      // Updating time and encoder counts. NOTE: Only encoder increments k
       double t  = timestamp_to_seconds(input);
       if (t < 0) {
         _error = "Could not read driver timestamp";
@@ -115,25 +115,7 @@ public:
       _current_enc_n_L = left;
       _current_enc_n_R = right;
 
-      // TODO: Move filter steps to process, possibly with private functions for each step?
-      // Step 1: Encoder increments
-      int delta_enc_n_L = _current_enc_n_L - _prev_enc_n_L;
-      int delta_enc_n_R = _current_enc_n_R - _prev_enc_n_R;
-      _delta_s_L = (2*M_PI*_wheel_radius) / _enc_res * delta_enc_n_L;
-      _delta_s_R = (2*M_PI*_wheel_radius) / _enc_res * delta_enc_n_R;
-      _delta_s_E = (_delta_s_R + _delta_s_L) / 2;
-      _delta_attitude_E = (_delta_s_R - _delta_s_L) / _wheel_base; // Sign convention: v_R > v_L
-
-      // Step 2: Gyro increments
-      _T_c = _current_time - _prev_time;
-      if (_T_c < 0.0) {_T_c += 86400.0;}  // Time crossed midnight
-      if (_T_c <= 0 || _T_c > 1.0) { // invalid or suspicious step
-        _error = "Invalid time step: " + to_string(_T_c) + " s";
-        return return_type::retry;
-      }
-      _delta_attitude_G = _T_c * (_current_w_G - _gyro_bias);
-
-      return return_type::success; // Go to process. NOTE: Only encoder messages increment k
+      return return_type::success; // Go to process. NOTE: Only encoder messages start process
     }
     
     // --- Gyro Message ---
@@ -158,23 +140,28 @@ public:
   // return_type::error: _error is traced via register_event, don't publish
   // return_type::critical: execution stops
   return_type process(json &out, vector<unsigned char> *blob = nullptr) override {
-    out.clear();
-    out["left_enc"] = _current_enc_n_L;
-    out["right_enc"] = _current_enc_n_R;
-    out["delta_left_enc"] = _current_enc_n_L - _prev_enc_n_L;
-    out["delta_right_enc"] = _current_enc_n_R - _prev_enc_n_R;
-    out["delta_distance_L"] = _delta_s_L;
-    out["delta_distance_R"] = _delta_s_R;
-    out["delta_distance_E"] = _delta_s_E;
-    out["delta_attitude_E"] = _delta_attitude_E;
-    out["T_c"] = _T_c;
-    out["delta_attitude_G"] = _delta_attitude_G;
+
+    encoder_increments();                   // Step 1
+    bool time_ok = gyro_increment();        // Step 2
 
     // load the data as necessary and set the fields of the json out variable
+    out.clear();
+    out["encoder"]["left_enc"] = _current_enc_n_L;
+    out["encoder"]["right_enc"] = _current_enc_n_R;
+    out["encoder"]["delta_left_enc"] = _current_enc_n_L - _prev_enc_n_L;
+    out["encoder"]["delta_right_enc"] = _current_enc_n_R - _prev_enc_n_R;
+    out["encoder"]["delta_distance_L"] = _delta_s_L;
+    out["encoder"]["delta_distance_R"] = _delta_s_R;
+    out["encoder"]["delta_distance_E"] = _delta_s_E;
+    out["encoder"]["delta_attitude_E"] = _delta_attitude_E;
+    out["gyro"]["T_c"] = _T_c;
+    out["gyro"]["delta_attitude_G"] = _delta_attitude_G;
 
     // This sets the agent_id field in the output json object, only when it is
     // not empty
     if (!_agent_id.empty()) out["agent_id"] = _agent_id;
+
+    if (!time_ok) {return return_type::warning;}   // publish, with _error attached
     return return_type::success;
   }
 
@@ -250,6 +237,35 @@ private:
   double _current_w_G = 0.0; // [rad/s]
   double _gyro_bias = 0.0;
   double _delta_attitude_G = 0.0; // [rad]
+
+  // Functions
+  void encoder_increments() {
+    int delta_enc_n_L = _current_enc_n_L - _prev_enc_n_L;
+    int delta_enc_n_R = _current_enc_n_R - _prev_enc_n_R;
+    _delta_s_L = (2*M_PI*_wheel_radius) / _enc_res * delta_enc_n_L;
+    _delta_s_R = (2*M_PI*_wheel_radius) / _enc_res * delta_enc_n_R;
+    _delta_s_E = (_delta_s_R + _delta_s_L) / 2;
+    _delta_attitude_E = (_delta_s_R - _delta_s_L) / _wheel_base; // Sign convention: v_R > v_L
+  }
+
+  bool compute_time_step() {
+    _T_c = _current_time - _prev_time;
+    if (_T_c < 0.0) {_T_c += 86400.0;}  // crossed midnight: add one day in seconds
+    if (_T_c <= 0.0 || _T_c > 1.0) {
+      _error = "Invalid time step: " + to_string(_T_c) + " s";
+      return false;
+    }
+    return true;
+  }
+
+  bool gyro_increment() {
+    if (!compute_time_step()) {
+      _delta_attitude_G = _delta_attitude_E;   // no valid T_c: use the encoder value
+      return false;
+    }
+    _delta_attitude_G = _T_c * (_current_w_G - _gyro_bias);
+    return true;
+  }
 };
 
 
