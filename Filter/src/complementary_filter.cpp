@@ -18,6 +18,9 @@
 #include <pugg/Kernel.h>
 
 // other includes as needed here
+#define _USE_MATH_DEFINES
+#include <math.h>
+#include <cstdio>
 
 // Define the name of the plugin
 #ifndef PLUGIN_NAME
@@ -27,6 +30,21 @@
 // Load the namespaces
 using namespace std;
 using json = nlohmann::json;
+
+// Helper functions
+
+// Converts a message's timestamp ("2026-10-08T08:29:55.726+0200") into
+// seconds since midnight (here 30595.726).
+// Returns -1 if the timestamp can't be read.
+double timestamp_to_seconds(const json &msg) {
+  string s = msg["timestamp"]["$date"].get<string>();
+  int h, m;
+  double sec;
+  if (s.size() < 19 || sscanf(s.c_str() + 11, "%d:%d:%lf", &h, &m, &sec) != 3) {
+    return -1.0;
+  }
+  return h * 3600.0 + m * 60.0 + sec;
+}
 
 
 // Plugin class. This shall be the only part that needs to be modified,
@@ -57,17 +75,77 @@ public:
   // return_type::critical: execution stops
   return_type load_data(json const &input, string topic = "", vector<unsigned char> const *blob = nullptr) override {
     // Do something with the input data
+    cout << "load_data: topic = " << topic << endl; // Debugging print
+    if (!_params_ok) {return return_type::critical;}
+    
+    // --- Driver Message ---
     if (topic == "driver") {
-      if (input.contains("encoders")) {
-        _prev_enc_count_left = _current_enc_count_left;
-        _prev_enc_count_right = _current_enc_count_right;
-        _current_enc_count_left = input["encoders"].value("left", 0);
-        _current_enc_count_right = input["encoders"].value("right", 0);
-        return return_type::success;
+      if (!input.contains("encoders")) {
+        _error = "Driver message without 'encoder' field";
+        return return_type::error;
       }
+      if (!input.contains("timestamp")) {
+        _error = "Driver message without 'timestamp' field";
+        return return_type::error;
+      }
+
+      // Updating time and encoder counts
+      double t  = timestamp_to_seconds(input);
+      if (t < 0) {
+        _error = "Could not read driver timestamp";
+        return return_type::error;
+      }
+      int left  = input["encoders"].value("left", _current_enc_n_L);
+      int right = input["encoders"].value("right", _current_enc_n_R);
+
+      // First message: nothing to compare with yet, just store counts
+      if (_first_driver) {
+        _current_time = t;
+        _current_enc_n_L = left;
+        _current_enc_n_R = right;
+        _first_driver = false;
+        return return_type::retry; // Skip processing
+      }
+
+      // Updating variables
+      _prev_time = _current_time;
+      _current_time = t;
+      _prev_enc_n_L = _current_enc_n_L;
+      _prev_enc_n_R = _current_enc_n_R;
+      _current_enc_n_L = left;
+      _current_enc_n_R = right;
+
+      // TODO: Move filter steps to process, possibly with private functions for each step?
+      // Step 1: Encoder increments
+      int delta_enc_n_L = _current_enc_n_L - _prev_enc_n_L;
+      int delta_enc_n_R = _current_enc_n_R - _prev_enc_n_R;
+      _delta_s_L = (2*M_PI*_wheel_radius) / _enc_res * delta_enc_n_L;
+      _delta_s_R = (2*M_PI*_wheel_radius) / _enc_res * delta_enc_n_R;
+      _delta_s_E = (_delta_s_R + _delta_s_L) / 2;
+      _delta_attitude_E = (_delta_s_R - _delta_s_L) / _wheel_base; // Sign convention: v_R > v_L
+
+      // Step 2: Gyro increments
+      _T_c = _current_time - _prev_time;
+      if (_T_c < 0.0) {_T_c += 86400.0;}  // Time crossed midnight
+      if (_T_c <= 0 || _T_c > 1.0) { // invalid or suspicious step
+        _error = "Invalid time step: " + to_string(_T_c) + " s";
+        return return_type::retry;
+      }
+      _delta_attitude_G = _T_c * (_current_w_G - _gyro_bias);
+
+      return return_type::success; // Go to process. NOTE: Only encoder messages increment k
     }
     
-    return return_type::success;
+    // --- Gyro Message ---
+    else if (topic == "calibrated_imu") {
+      // Updating variables
+      _current_w_G = input.value("gyro", _current_w_G);
+    }
+
+    // --- HTC Message ---
+    else if (topic == "htc" ) {}
+
+    return return_type::retry; // Ignore all other topics
   }
 
 
@@ -81,6 +159,16 @@ public:
   // return_type::critical: execution stops
   return_type process(json &out, vector<unsigned char> *blob = nullptr) override {
     out.clear();
+    out["left_enc"] = _current_enc_n_L;
+    out["right_enc"] = _current_enc_n_R;
+    out["delta_left_enc"] = _current_enc_n_L - _prev_enc_n_L;
+    out["delta_right_enc"] = _current_enc_n_R - _prev_enc_n_R;
+    out["delta_distance_L"] = _delta_s_L;
+    out["delta_distance_R"] = _delta_s_R;
+    out["delta_distance_E"] = _delta_s_E;
+    out["delta_attitude_E"] = _delta_attitude_E;
+    out["T_c"] = _T_c;
+    out["delta_attitude_G"] = _delta_attitude_G;
 
     // load the data as necessary and set the fields of the json out variable
 
@@ -101,13 +189,24 @@ public:
     Filter::set_params(params);
 
     // provide sensible defaults for the parameters by setting e.g.
-    _params["some_field"] = "default_value";
+    // _params["some_field"] = "default_value";
     // more here...
+    _params["gyro_bias"] = 0.0; // TODO: Update the actual value here or .ini
 
     // then merge the defaults with the actually provided parameters
     // params needs to be cast to json
     _params.merge_patch(params);
-      
+
+    if (!_params.contains("wheel_radius") || !_params.contains("wheel_base")) {
+      _error = "wheel radius and wheel_base must be set in mads.ini file";
+      _params_ok = false;
+      return;
+    }
+
+    _wheel_radius = _params["wheel_radius"];
+    _wheel_base = _params["wheel_base"];
+    _gyro_bias = _params["gyro_bias"].get<double>();
+    _params_ok = true;
   }
 
   // Implement this method if you want to provide additional information
@@ -122,10 +221,35 @@ public:
 
 private:
   // Define the fields that are used to store internal resources
-  int _prev_enc_count_left = 0;
-  int _prev_enc_count_right = 0;
-  int _current_enc_count_left = 0;
-  int _current_enc_count_right = 0;
+
+  // Time
+  double _prev_time = 0.0;  // [s since midnight]
+  double _current_time = 0.0;
+  double _T_c = 0.0; // [s] time since the previous driver message
+
+  // Flags
+  bool _params_ok = false;
+  bool _first_driver = true;
+
+  // Parameters
+  double _wheel_radius = 0.0; // [m]
+  double _wheel_base = 0.0;
+  const double _enc_res = 4096.0; // [ticks]
+
+  // Encoder variables
+  int _prev_enc_n_L = 0; // [ticks]
+  int _prev_enc_n_R = 0;
+  int _current_enc_n_L = 0;
+  int _current_enc_n_R = 0;
+  double _delta_s_L = 0.0; // [m]
+  double _delta_s_R = 0.0;
+  double _delta_s_E = 0.0;
+  double _delta_attitude_E = 0.0; // [rad]
+
+  // Gyro variables
+  double _current_w_G = 0.0; // [rad/s]
+  double _gyro_bias = 0.0;
+  double _delta_attitude_G = 0.0; // [rad]
 };
 
 
