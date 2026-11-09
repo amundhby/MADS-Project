@@ -142,7 +142,7 @@ public:
   return_type process(json &out, vector<unsigned char> *blob = nullptr) override {
 
     encoder_increments();                   // Step 1
-    bool time_ok = gyro_increment();        // Step 2
+    gyro_increment();        // Step 2
 
     // load the data as necessary and set the fields of the json out variable
     out.clear();
@@ -161,7 +161,7 @@ public:
     // not empty
     if (!_agent_id.empty()) out["agent_id"] = _agent_id;
 
-    if (!time_ok) {return return_type::warning;}   // publish, with _error attached
+    if (!_time_ok) {return return_type::warning;}   // publish, with _error attached
     return return_type::success;
   }
 
@@ -217,6 +217,7 @@ private:
   // Flags
   bool _params_ok = false;
   bool _first_driver = true;
+  bool _time_ok = true;
 
   // Parameters
   double _wheel_radius = 0.0; // [m]
@@ -258,13 +259,14 @@ private:
     return true;
   }
 
-  bool gyro_increment() {
+  void gyro_increment() {
     if (!compute_time_step()) {
       _delta_attitude_G = _delta_attitude_E;   // no valid T_c: use the encoder value
-      return false;
+      _time_ok = false;
+      return;
     }
     _delta_attitude_G = _T_c * (_current_w_G - _gyro_bias);
-    return true;
+    _time_ok = true;
   }
 };
 
