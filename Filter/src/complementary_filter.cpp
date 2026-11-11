@@ -31,7 +31,7 @@
 using namespace std;
 using json = nlohmann::json;
 
-// Helper functions
+// --- Helper functions ---
 
 // Converts a message's timestamp ("2026-10-08T08:29:55.726+0200") into
 // seconds since midnight (here 30595.726).
@@ -75,7 +75,7 @@ public:
   // return_type::critical: execution stops
   return_type load_data(json const &input, string topic = "", vector<unsigned char> const *blob = nullptr) override {
     // Do something with the input data
-    cout << "load_data: topic = " << topic << endl; // Debugging print
+    cout << "load_data: topic = " << topic << endl; // Debugging print, TODO: Remove
     if (!_params_ok) {return return_type::critical;}
     
     // --- Driver Message ---
@@ -89,7 +89,8 @@ public:
         return return_type::error;
       }
 
-      // Updating time and encoder counts. NOTE: Only encoder increments k
+      // Loading time and encoder counts. NOTE: Only encoder increments k
+      // TODO: Change only encoder counting? Update within same timestamps, etc.
       double t  = timestamp_to_seconds(input);
       if (t < 0) {
         _error = "Could not read driver timestamp";
@@ -122,6 +123,7 @@ public:
     else if (topic == "calibrated_imu") {
       // Updating variables
       _current_w_G = input.value("gyro", _current_w_G);
+      _have_gyro = true;
     }
 
     // --- HTC Message ---
@@ -141,8 +143,10 @@ public:
   // return_type::critical: execution stops
   return_type process(json &out, vector<unsigned char> *blob = nullptr) override {
 
-    encoder_increments();                   // Step 1
-    gyro_increment();        // Step 2
+    encoder_increments();     // Step 1
+    gyro_increment();         // Step 2
+    maneuver_weights();       // Step 3
+    encoder_gyro_fusion();    // Step 4
 
     // load the data as necessary and set the fields of the json out variable
     out.clear();
@@ -154,8 +158,15 @@ public:
     out["encoder"]["delta_distance_R"] = _delta_s_R;
     out["encoder"]["delta_distance_E"] = _delta_s_E;
     out["encoder"]["delta_attitude_E"] = _delta_attitude_E;
+
     out["gyro"]["T_c"] = _T_c;
     out["gyro"]["delta_attitude_G"] = _delta_attitude_G;
+
+    out["maneuver"]["u"] = _u;
+    out["maneuver"]["q"] = _q;
+    out["maneuver"]["xi_R"] = _xi_R;
+
+    out["fusion"]["delta_attitude_EG"] = _delta_attitude_EG;
 
     // This sets the agent_id field in the output json object, only when it is
     // not empty
@@ -178,7 +189,8 @@ public:
     // provide sensible defaults for the parameters by setting e.g.
     // _params["some_field"] = "default_value";
     // more here...
-    _params["gyro_bias"] = 0.0; // TODO: Update the actual value here or .ini
+    _params["gyro_bias"] = 0.0; // TODO: Tune the actual value here or .ini
+    _params["s_ref"] = 0.002; // TODO: Tune the actual value here or .ini
 
     // then merge the defaults with the actually provided parameters
     // params needs to be cast to json
@@ -192,7 +204,16 @@ public:
 
     _wheel_radius = _params["wheel_radius"];
     _wheel_base = _params["wheel_base"];
-    _gyro_bias = _params["gyro_bias"].get<double>();
+    _gyro_bias = _params["gyro_bias"];
+    _s_ref = _params["s_ref"];
+
+    // Sanity check for sensitive variables
+    if (_wheel_radius <= 0 || _wheel_base <= 0 || _s_ref <= 0) {
+      _error = "wheel_radius, wheel_base and s_ref must be > 0";
+      _params_ok = false;
+      return;
+    }
+
     _params_ok = true;
   }
 
@@ -215,14 +236,18 @@ private:
   double _T_c = 0.0; // [s] time since the previous driver message
 
   // Flags
-  bool _params_ok = false;
-  bool _first_driver = true;
-  bool _time_ok = true;
+  bool _params_ok = false;  // Set true if initial parameter as ok
+  bool _first_driver = true;  // False after first driver message arrived
+  bool _time_ok = true; // False if _T_c not valid
+  bool _have_gyro = false;  // True once first gyro message arrived
 
   // Parameters
   double _wheel_radius = 0.0; // [m]
   double _wheel_base = 0.0;
+  double _gyro_bias = 0.0;
   const double _enc_res = 4096.0; // [ticks]
+  double _s_ref = 0.0; // [m] Parameter that indicates true movement
+  const double _epsilon = 1e-9; // Constant to hinder division by 0
 
   // Encoder variables
   int _prev_enc_n_L = 0; // [ticks]
@@ -236,8 +261,15 @@ private:
 
   // Gyro variables
   double _current_w_G = 0.0; // [rad/s]
-  double _gyro_bias = 0.0;
   double _delta_attitude_G = 0.0; // [rad]
+
+  // Manuever index variables
+  double _u = 0.0; // [0, 1] Indicates how much walker is turning
+  double _q = 0.0; // [0, 1] Indicates if the walker is moving
+  double _xi_R = 0.0; // [0, 4] Indicates trust in encoder vs. gyro
+
+  // Encoder-gyro fusion variables
+  double _delta_attitude_EG = 0.0; // [rad]
 
   // Functions
   void encoder_increments() {
@@ -260,13 +292,25 @@ private:
   }
 
   void gyro_increment() {
-    if (!compute_time_step()) {
-      _delta_attitude_G = _delta_attitude_E;   // no valid T_c: use the encoder value
-      _time_ok = false;
+    _time_ok = compute_time_step();
+
+    if (!_time_ok || !_have_gyro) { // Check if _T_c not valid or if no gyro message
+      _delta_attitude_G = _delta_attitude_E; // Use encoder value as backup for this step
       return;
     }
+
     _delta_attitude_G = _T_c * (_current_w_G - _gyro_bias);
-    _time_ok = true;
+  }
+
+  void maneuver_weights() {
+    _u = fabs(_delta_s_R - _delta_s_L)/(fabs(_delta_s_R) + fabs(_delta_s_L) + _epsilon);
+    _q = 1 - exp(-(fabs(_delta_s_R) + fabs(_delta_s_L)) / _s_ref);
+    _xi_R = _q * (0.25 + 3.75 * _u);
+  }
+
+  void encoder_gyro_fusion() {
+    _delta_attitude_EG = 1 / (1 + pow(_xi_R, 2)) * _delta_attitude_E +
+                        pow(_xi_R, 2) / (1 + pow(_xi_R, 2)) * _delta_attitude_G;
   }
 };
 
