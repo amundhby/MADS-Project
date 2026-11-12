@@ -276,7 +276,11 @@ private:
   double _delta_attitude_EG = 0.0;      // [rad]
 
   // Attitude estimate variables
-  double _attitude_EG = 0.0;      // [rad]
+  double _attitude_EG = 0.0;          // [rad]
+
+  // Attitude filter variables
+  double _prev_attitude_F = 0.0;      // [rad]
+  double _current_attitude_F = 0.0;   // [rad]
 
   // Functions
   void encoder_increments() {
