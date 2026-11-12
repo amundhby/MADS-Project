@@ -127,7 +127,9 @@ public:
     }
 
     // --- HTC Message ---
-    else if (topic == "htc" ) {}
+    else if (topic == "htc" ) {
+
+    }
 
     return return_type::retry; // Ignore all other topics
   }
@@ -143,10 +145,11 @@ public:
   // return_type::critical: execution stops
   return_type process(json &out, vector<unsigned char> *blob = nullptr) override {
 
-    encoder_increments();     // Step 1
-    gyro_increment();         // Step 2
-    maneuver_weights();       // Step 3
-    encoder_gyro_fusion();    // Step 4
+    encoder_increments();                 // Step 1
+    gyro_increment();                     // Step 2
+    maneuver_weights();                   // Step 3
+    encoder_gyro_fusion();                // Step 4
+    encoder_gyro_attitude_estimate();     // Step 5
 
     // load the data as necessary and set the fields of the json out variable
     out.clear();
@@ -167,6 +170,7 @@ public:
     out["maneuver"]["xi_R"] = _xi_R;
 
     out["fusion"]["delta_attitude_EG"] = _delta_attitude_EG;
+    out["fusion"]["attitude_EG"] = _attitude_EG;
 
     // This sets the agent_id field in the output json object, only when it is
     // not empty
@@ -231,45 +235,48 @@ private:
   // Define the fields that are used to store internal resources
 
   // Time
-  double _prev_time = 0.0;  // [s since midnight]
-  double _current_time = 0.0;
-  double _T_c = 0.0; // [s] time since the previous driver message
+  double _prev_time = 0.0;          // [s since midnight]
+  double _current_time = 0.0;       // [s since midnight]
+  double _T_c = 0.0;                // [s] time since the previous driver message
 
   // Flags
-  bool _params_ok = false;  // Set true if initial parameter as ok
-  bool _first_driver = true;  // False after first driver message arrived
-  bool _time_ok = true; // False if _T_c not valid
-  bool _have_gyro = false;  // True once first gyro message arrived
+  bool _params_ok = false;          // Set true if initial parameter as ok
+  bool _first_driver = true;        // False after first driver message arrived
+  bool _time_ok = true;             // False if _T_c not valid
+  bool _have_gyro = false;          // True once first gyro message arrived
 
   // Parameters
-  double _wheel_radius = 0.0; // [m]
-  double _wheel_base = 0.0;
-  double _gyro_bias = 0.0;
-  const double _enc_res = 4096.0; // [ticks]
-  double _s_ref = 0.0; // [m] Parameter that indicates true movement
-  const double _epsilon = 1e-9; // Constant to hinder division by 0
+  double _wheel_radius = 0.0;         // [m] Set in set_params
+  double _wheel_base = 0.0;           // [m] Set in set_params
+  double _gyro_bias = 0.0;            // [rad/s] Set in set_params
+  const double _enc_res = 4096.0;     // [ticks] Ticks per rev
+  double _s_ref = 0.0;                // [m] Reference for true movement, set in set_params
+  const double _epsilon = 1e-9;       // Constant that hinders division by 0 in step 4
 
   // Encoder variables
-  int _prev_enc_n_L = 0; // [ticks]
-  int _prev_enc_n_R = 0;
-  int _current_enc_n_L = 0;
-  int _current_enc_n_R = 0;
-  double _delta_s_L = 0.0; // [m]
-  double _delta_s_R = 0.0;
-  double _delta_s_E = 0.0;
-  double _delta_attitude_E = 0.0; // [rad]
+  int _prev_enc_n_L = 0;            // [ticks]
+  int _prev_enc_n_R = 0;            // [ticks]
+  int _current_enc_n_L = 0;         // [ticks]
+  int _current_enc_n_R = 0;         // [ticks]
+  double _delta_s_L = 0.0;          // [m]
+  double _delta_s_R = 0.0;          // [m]
+  double _delta_s_E = 0.0;          // [m]
+  double _delta_attitude_E = 0.0;   // [rad]
 
   // Gyro variables
-  double _current_w_G = 0.0; // [rad/s]
-  double _delta_attitude_G = 0.0; // [rad]
+  double _current_w_G = 0.0;          // [rad/s]
+  double _delta_attitude_G = 0.0;     // [rad]
 
   // Manuever index variables
-  double _u = 0.0; // [0, 1] Indicates how much walker is turning
-  double _q = 0.0; // [0, 1] Indicates if the walker is moving
-  double _xi_R = 0.0; // [0, 4] Indicates trust in encoder vs. gyro
+  double _u = 0.0;           // [0, 1] Indicates how much walker is turning
+  double _q = 0.0;           // [0, 1] Indicates if the walker is moving
+  double _xi_R = 0.0;        // [0, 4] Indicates trust in encoder vs. gyro
 
   // Encoder-gyro fusion variables
-  double _delta_attitude_EG = 0.0; // [rad]
+  double _delta_attitude_EG = 0.0;      // [rad]
+
+  // Attitude estimate variables
+  double _attitude_EG = 0.0;      // [rad]
 
   // Functions
   void encoder_increments() {
@@ -283,7 +290,7 @@ private:
 
   bool compute_time_step() {
     _T_c = _current_time - _prev_time;
-    if (_T_c < 0.0) {_T_c += 86400.0;}  // crossed midnight: add one day in seconds
+    if (_T_c < 0.0) {_T_c += 86400.0;}  // Crossed midnight: add one day in seconds
     if (_T_c <= 0.0 || _T_c > 1.0) {
       _error = "Invalid time step: " + to_string(_T_c) + " s";
       return false;
@@ -311,6 +318,10 @@ private:
   void encoder_gyro_fusion() {
     _delta_attitude_EG = 1 / (1 + pow(_xi_R, 2)) * _delta_attitude_E +
                         pow(_xi_R, 2) / (1 + pow(_xi_R, 2)) * _delta_attitude_G;
+  }
+
+  void encoder_gyro_attitude_estimate() {
+    _attitude_EG += _delta_attitude_EG;
   }
 };
 
