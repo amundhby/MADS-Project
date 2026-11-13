@@ -412,6 +412,7 @@ private:
   }
 
   void attitude_complementary_filter() {
+    // TODO: Problems at robot init when no history / abrupt changes when values 0->input?
     _attitude_F = _HP_attitude.step(_attitude_EG) + _LP_attitude.step(_attitude_H);
   }
 };
