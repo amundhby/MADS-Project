@@ -21,6 +21,7 @@
 #define _USE_MATH_DEFINES
 #include <math.h>
 #include <cstdio>
+#include <array>
 
 // Define the name of the plugin
 #ifndef PLUGIN_NAME
@@ -45,6 +46,29 @@ double timestamp_to_seconds(const json &msg) {
   }
   return h * 3600.0 + m * 60.0 + sec;
 }
+
+// --- Filter ---
+// Third-order discrete IIR filter: y_k = sum_{i=0..3} b_i x_{k-i} - sum_{i=1..3} a_i y_{k-i}
+// x[0], y[0] are the newest values; x[3], y[3] the oldest.
+struct IIR3 {
+  array<double, 4> b = {1.0, 0.0, 0.0, 0.0};
+  array<double, 4> a = {1.0, 0.0, 0.0, 0.0}; // a[0] placeholder
+  array<double, 4> x{};  // Filter input history
+  array<double, 4> y{};  // Filter output history
+
+  double step(double input) {
+    for (int i = 3; i >= 1; --i) {
+      x[i] = x[i-1];
+      y[i] = y[i-1];
+    }
+    x[0] = input;
+    double out = 0.0;
+    for (int i = 0; i <= 3; ++i) {out += b[i] * x[i];}
+    for (int i = 1; i <= 3; ++i) {out -= a[i] * y[i];}
+    y[0] = out;
+    return out;
+  }
+};
 
 
 // Plugin class. This shall be the only part that needs to be modified,
@@ -128,7 +152,26 @@ public:
 
     // --- HTC Message ---
     else if (topic == "htc" ) {
+      if (!input.contains("Htracker") || !input["Htracker"].contains("pose")) {
+        _error = "HTC message without 'Htracker' or 'pose' field";
+        return return_type::error;
+      }
 
+      const json &H = input["Htracker"]["pose"]["H"];
+      _x_H = H[0][3];
+      _y_H = H[1][3];
+      double yaw_H = atan2(H[1][0].get<double>(), H[0][0].get<double>());
+      _attitude_TEST = input["Htracker"]["pose"]["attitude"][2]; // TEST ONLY. TODO: Remove
+
+      if (_first_htc) {
+        _attitude_H = yaw_H;
+        _first_htc = false;
+      } else {
+        double d = yaw_H - _prev_yaw_H;
+        d = atan2(sin(d), cos(d));  // wrap the change into [-pi, pi]
+        _attitude_H += d;
+      }
+      _prev_yaw_H = yaw_H;
     }
 
     return return_type::retry; // Ignore all other topics
@@ -144,12 +187,20 @@ public:
   // return_type::error: _error is traced via register_event, don't publish
   // return_type::critical: execution stops
   return_type process(json &out, vector<unsigned char> *blob = nullptr) override {
+    // Questions:
+    // Euler angle vs. H matrix
+    // Can we ignore noise with rotation around x and y axis' when we calculate rotation around z
+
+    // Testing:
+    // mu and rho variables
+    // validate other variables with known robot movement
 
     encoder_increments();                 // Step 1
     gyro_increment();                     // Step 2
     maneuver_weights();                   // Step 3
     encoder_gyro_fusion();                // Step 4
     encoder_gyro_attitude_estimate();     // Step 5
+    attitude_complementary_filter();      // Step 6
 
     // load the data as necessary and set the fields of the json out variable
     out.clear();
@@ -171,6 +222,13 @@ public:
 
     out["fusion"]["delta_attitude_EG"] = _delta_attitude_EG;
     out["fusion"]["attitude_EG"] = _attitude_EG;
+
+    out["htc"]["x_H"] = _x_H;
+    out["htc"]["y_H"] = _y_H;
+    out["htc"]["attitude_H"] = _attitude_H;
+    out["htc"]["attitude_EULER_ANGLE_TEST"] = _attitude_TEST; // TODO: Remove
+
+    out["Filter"]["attitude_F"] = _attitude_F;
 
     // This sets the agent_id field in the output json object, only when it is
     // not empty
@@ -195,6 +253,9 @@ public:
     // more here...
     _params["gyro_bias"] = 0.0; // TODO: Tune the actual value here or .ini
     _params["s_ref"] = 0.002; // TODO: Tune the actual value here or .ini
+    _params["b_hp_attitude"] = {1.0, 0.0, 0.0, 0.0}; // TODO: Replace all filter coefficients!!!
+    _params["b_lp_attitude"] = {0.0, 0.0, 0.0, 0.0};
+    _params["a_attitude"] = {1.0, 0.0, 0.0, 0.0};
 
     // then merge the defaults with the actually provided parameters
     // params needs to be cast to json
@@ -210,12 +271,25 @@ public:
     _wheel_base = _params["wheel_base"];
     _gyro_bias = _params["gyro_bias"];
     _s_ref = _params["s_ref"];
+    _HP_attitude.b = _params["b_hp_attitude"];
+    _LP_attitude.b = _params["b_lp_attitude"];
+    _HP_attitude.a = _params["a_attitude"];
+    _LP_attitude.a = _params["a_attitude"];
 
     // Sanity check for sensitive variables
     if (_wheel_radius <= 0 || _wheel_base <= 0 || _s_ref <= 0) {
       _error = "wheel_radius, wheel_base and s_ref must be > 0";
       _params_ok = false;
       return;
+    }
+
+    // Complementarity: HP + LP = 1 means b_hp + b_lp = a, coefficient by coefficient
+    for (int i = 0; i < 4; ++i) {
+      if (fabs(_HP_attitude.b[i] + _LP_attitude.b[i] - _HP_attitude.a[i]) > 1e-6) {
+        _error = "Attitude filter is not complementary: b_hp + b_lp != a";
+        _params_ok = false;
+        return;
+      }
     }
 
     _params_ok = true;
@@ -244,6 +318,7 @@ private:
   bool _first_driver = true;        // False after first driver message arrived
   bool _time_ok = true;             // False if _T_c not valid
   bool _have_gyro = false;          // True once first gyro message arrived
+  bool _first_htc = true;           // False after first htc message arrived
 
   // Parameters
   double _wheel_radius = 0.0;         // [m] Set in set_params
@@ -276,11 +351,19 @@ private:
   double _delta_attitude_EG = 0.0;      // [rad]
 
   // Attitude estimate variables
-  double _attitude_EG = 0.0;          // [rad]
+  double _attitude_EG = 0.0;            // [rad]
+
+  // HTC variables
+  double _x_H = 0.0;                    // [m]
+  double _y_H = 0.0;                    // [m]
+  double _prev_yaw_H = 0.0;             // [Rad]
+  double _attitude_H = 0.0;             // [Rad] Rotation around z-axis
 
   // Attitude filter variables
-  double _prev_attitude_F = 0.0;      // [rad]
-  double _current_attitude_F = 0.0;   // [rad]
+  double _attitude_F = 0.0;           // [rad]
+  double _attitude_TEST = 0.0;        // TEST ONLY
+  IIR3 _LP_attitude;                  // Low-pass on _attitude_H
+  IIR3 _HP_attitude;                  // High-pass on _attitude_EG
 
   // Functions
   void encoder_increments() {
@@ -326,6 +409,10 @@ private:
 
   void encoder_gyro_attitude_estimate() {
     _attitude_EG += _delta_attitude_EG;
+  }
+
+  void attitude_complementary_filter() {
+    _attitude_F = _HP_attitude.step(_attitude_EG) + _LP_attitude.step(_attitude_H);
   }
 };
 
