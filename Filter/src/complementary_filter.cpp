@@ -198,9 +198,12 @@ public:
     encoder_increments();                 // Step 1
     gyro_increment();                     // Step 2
     maneuver_weights();                   // Step 3
-    encoder_gyro_fusion();                // Step 4
+    encoder_gyro_attitude_fusion();       // Step 4
     encoder_gyro_attitude_estimate();     // Step 5
     attitude_complementary_filter();      // Step 6
+
+    encoder_gyro_position_estimate();     // Step 7
+    
 
     // load the data as necessary and set the fields of the json out variable
     out.clear();
@@ -365,6 +368,12 @@ private:
   IIR3 _LP_attitude;                  // Low-pass on _attitude_H
   IIR3 _HP_attitude;                  // High-pass on _attitude_EG
 
+  // Encoder position estimate variables
+  double _prev_x_EG = 0.0;
+  double _prev_y_EG = 0.0;
+  double _current_x_EG = 0.0;
+  double _current_y_EG = 0.0;
+
   // Functions
   void encoder_increments() {
     int delta_enc_n_L = _current_enc_n_L - _prev_enc_n_L;
@@ -413,6 +422,19 @@ private:
 
   void attitude_complementary_filter() {
     _attitude_F = _HP_attitude.step(_attitude_EG) + _LP_attitude.step(_attitude_H);
+  }
+
+  void encoder_gyro_position_estimate() {
+    double avg_attitude_F = (_prev_attitude_F + _current_attitude_F) / 2.0;
+
+    _prev_x_EG = _current_x_EG;
+    _prev_y_EG = _current_y_EG;
+    _current_x_EG = _prev_x_EG + _delta_s_E * cos(avg_attitude_F);
+    _current_y_EG = _prev_y_EG + _delta_s_E * sin(avg_attitude_F);
+  }
+
+  void position_complementary_filter() {
+    
   }
 };
 
