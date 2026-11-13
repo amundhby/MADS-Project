@@ -411,7 +411,7 @@ private:
     _xi_R = _q * (0.25 + 3.75 * _u);
   }
 
-  void encoder_gyro_fusion() {
+  void encoder_gyro_attitude_fusion() {
     _delta_attitude_EG = 1 / (1 + pow(_xi_R, 2)) * _delta_attitude_E +
                         pow(_xi_R, 2) / (1 + pow(_xi_R, 2)) * _delta_attitude_G;
   }
