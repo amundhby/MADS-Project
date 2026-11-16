@@ -56,6 +56,15 @@ struct IIR3 {
   array<double, 4> x{};  // Filter input history
   array<double, 4> y{};  // Filter output history
 
+  // Fills the history as if the input had always been x0.
+  // The output history is then the filter's steady-state response to x0.
+  void init(double x0) {
+    double sum_b = b[0] + b[1] + b[2] + b[3];
+    double sum_a = a[0] + a[1] + a[2] + a[3];
+    x.fill(x0);
+    y.fill(x0 * sum_b / sum_a);
+  }
+
   double step(double input) {
     for (int i = 3; i >= 1; --i) {
       x[i] = x[i-1];
@@ -99,7 +108,6 @@ public:
   // return_type::critical: execution stops
   return_type load_data(json const &input, string topic = "", vector<unsigned char> const *blob = nullptr) override {
     // Do something with the input data
-    cout << "load_data: topic = " << topic << endl; // Debugging print, TODO: Remove
     if (!_params_ok) {return return_type::critical;}
     
     // --- Driver Message ---
@@ -120,8 +128,16 @@ public:
         _error = "Could not read driver timestamp";
         return return_type::error;
       }
-      int left  = input["encoders"].value("left", _current_enc_n_L);
-      int right = input["encoders"].value("right", _current_enc_n_R);
+
+      // Loading encoder readings
+      const json &enc = input["encoders"];
+      if (!enc.contains("left") || !enc.contains("right") ||
+          !enc["left"].is_number() || !enc["right"].is_number()) {
+        _error = "Driver message with missing or invalid encoder counts";
+        return return_type::error;
+      }
+      int left = enc["left"].get<int>();
+      int right = enc["right"].get<int>();
 
       // First message: nothing to compare with yet, just store counts
       if (_first_driver) {
@@ -132,7 +148,7 @@ public:
         return return_type::retry; // Skip processing
       }
 
-      // Updating variables
+      // Updating class variables
       _prev_time = _current_time;
       _current_time = t;
       _prev_enc_n_L = _current_enc_n_L;
@@ -145,22 +161,41 @@ public:
     
     // --- Gyro Message ---
     else if (topic == "calibrated_imu") {
-      // Updating variables
-      _current_w_G = input.value("gyro", _current_w_G);
-      _have_gyro = true;
+      if (!input.contains("gyro") || !input["gyro"].is_number()) {
+        return return_type::retry;
+      }
+
+      // Loading gyro reading
+      double w = input["gyro"].get<double>();
+      if (!isfinite(w)) {return return_type::retry;}
+
+      // Updating class variables
+      _current_w_G = w;
+      _first_gyro = false;
     }
 
     // --- HTC Message ---
     else if (topic == "htc" ) {
-      if (!input.contains("Htracker") || !input["Htracker"].contains("pose")) {
-        _error = "HTC message without 'Htracker' or 'pose' field";
+      if (!input.contains("Htracker") || !input["Htracker"].contains("pose") || 
+        !input["Htracker"]["pose"].contains("H")) {
+        _error = "HTC message without 'Htracker', 'pose' or 'H field";
         return return_type::error;
       }
 
+      // Loading HTC readings
       const json &H = input["Htracker"]["pose"]["H"];
-      _x_H = H[0][3];
-      _y_H = H[1][3];
+      if (!H[0][3].is_number() || !H[1][3].is_number() ||
+          !H[0][0].is_number() || !H[1][0].is_number()) {
+        return return_type::retry;
+      }
+      double x = H[0][3].get<double>();
+      double y = H[1][3].get<double>();
       double yaw_H = atan2(H[1][0].get<double>(), H[0][0].get<double>());
+      if (!isfinite(x) || !isfinite(y) || !isfinite(yaw_H)) {return return_type::retry;}
+
+      // Updating class variables
+      _x_H = x;
+      _y_H = y;
       _attitude_TEST = input["Htracker"]["pose"]["attitude"][2]; // TEST ONLY. TODO: Remove
 
       if (_first_htc) {
@@ -190,19 +225,37 @@ public:
     // Questions:
     // Euler angle vs. H matrix
     // Can we ignore noise with rotation around x and y axis' when we calculate rotation around z
+    
+    // Question for group and/or prof:
+    // Variable naming for step 7. Use ctrl + f if replacing
 
     // Testing:
     // mu and rho variables
     // validate other variables with known robot movement
+    // Find gyro bias for load_params()
 
     encoder_increments();                 // Step 1
     gyro_increment();                     // Step 2
     maneuver_weights();                   // Step 3
     encoder_gyro_attitude_fusion();       // Step 4
     encoder_gyro_attitude_estimate();     // Step 5
-    attitude_complementary_filter();      // Step 6
 
+    // Start the filters once the HTC is available
+    if (!_filters_initialized) {
+      if (_first_htc) {return return_type::retry;}  // No HTC yet: don't publish
+      _HP_attitude.init(_attitude_EG);
+      _LP_attitude.init(_attitude_H);
+      _HP_x.init(_current_x_EG);
+      _LP_x.init(_x_H);
+      _HP_y.init(_current_y_EG);
+      _LP_y.init(_y_H);
+      _current_attitude_F = _attitude_H; // So the initial step 7 averages correctly
+      _filters_initialized = true;
+    }
+
+    attitude_complementary_filter();      // Step 6
     encoder_gyro_position_estimate();     // Step 7
+    position_complementary_filter();       // Step 8-9
     
 
     // load the data as necessary and set the fields of the json out variable
@@ -231,7 +284,11 @@ public:
     out["htc"]["attitude_H"] = _attitude_H;
     out["htc"]["attitude_EULER_ANGLE_TEST"] = _attitude_TEST; // TODO: Remove
 
-    out["Filter"]["attitude_F"] = _attitude_F;
+    out["filter"]["attitude_F"] = _current_attitude_F;
+    out["filter"]["x_EG"] = _current_x_EG;
+    out["filter"]["y_EG"] = _current_y_EG;
+    out["filter"]["x_F"] = _x_F;
+    out["filter"]["y_F"] = _y_F;
 
     // This sets the agent_id field in the output json object, only when it is
     // not empty
@@ -256,9 +313,14 @@ public:
     // more here...
     _params["gyro_bias"] = 0.0; // TODO: Tune the actual value here or .ini
     _params["s_ref"] = 0.002; // TODO: Tune the actual value here or .ini
+  
     _params["b_hp_attitude"] = {1.0, 0.0, 0.0, 0.0}; // TODO: Replace all filter coefficients!!!
     _params["b_lp_attitude"] = {0.0, 0.0, 0.0, 0.0};
     _params["a_attitude"] = {1.0, 0.0, 0.0, 0.0};
+
+    _params["b_hp_position"] = {1.0, 0.0, 0.0, 0.0}; // TODO: Replace
+    _params["b_lp_position"] = {0.0, 0.0, 0.0, 0.0};
+    _params["a_position"]    = {1.0, 0.0, 0.0, 0.0};
 
     // then merge the defaults with the actually provided parameters
     // params needs to be cast to json
@@ -274,10 +336,19 @@ public:
     _wheel_base = _params["wheel_base"];
     _gyro_bias = _params["gyro_bias"];
     _s_ref = _params["s_ref"];
+
     _HP_attitude.b = _params["b_hp_attitude"];
     _LP_attitude.b = _params["b_lp_attitude"];
     _HP_attitude.a = _params["a_attitude"];
     _LP_attitude.a = _params["a_attitude"];
+
+    _HP_x.b = _params["b_hp_position"];
+    _LP_x.b = _params["b_lp_position"];
+    _HP_x.a = _params["a_position"];
+    _LP_x.a = _params["a_position"];
+
+    _HP_y = _HP_x;
+    _LP_y = _LP_x;
 
     // Sanity check for sensitive variables
     if (_wheel_radius <= 0 || _wheel_base <= 0 || _s_ref <= 0) {
@@ -287,9 +358,18 @@ public:
     }
 
     // Complementarity: HP + LP = 1 means b_hp + b_lp = a, coefficient by coefficient
+    // Check for attitude filter
     for (int i = 0; i < 4; ++i) {
       if (fabs(_HP_attitude.b[i] + _LP_attitude.b[i] - _HP_attitude.a[i]) > 1e-6) {
         _error = "Attitude filter is not complementary: b_hp + b_lp != a";
+        _params_ok = false;
+        return;
+      }
+    }
+    // Check for position filters
+    for (int i = 0; i < 4; ++i) {
+      if (fabs(_HP_x.b[i] + _LP_x.b[i] - _HP_x.a[i]) > 1e-6) {
+        _error = "Position filter is not complementary: b_hp + b_lp != a";
         _params_ok = false;
         return;
       }
@@ -317,11 +397,12 @@ private:
   double _T_c = 0.0;                // [s] time since the previous driver message
 
   // Flags
-  bool _params_ok = false;          // Set true if initial parameter as ok
-  bool _first_driver = true;        // False after first driver message arrived
-  bool _time_ok = true;             // False if _T_c not valid
-  bool _have_gyro = false;          // True once first gyro message arrived
-  bool _first_htc = true;           // False after first htc message arrived
+  bool _params_ok = false;            // Set true if initial parameter as ok
+  bool _first_driver = true;          // True until first driver message arrived
+  bool _first_gyro = true;            // True until first gyro message arrived
+  bool _first_htc = true;             // True until first htc message arrived
+  bool _time_ok = true;               // False if _T_c not valid
+  bool _filters_initialized = false;  // False until filters initialized
 
   // Parameters
   double _wheel_radius = 0.0;         // [m] Set in set_params
@@ -363,16 +444,25 @@ private:
   double _attitude_H = 0.0;             // [Rad] Rotation around z-axis
 
   // Attitude filter variables
-  double _attitude_F = 0.0;           // [rad]
+  double _prev_attitude_F = 0.0;      // [rad]
+  double _current_attitude_F = 0.0;   // [rad]
   double _attitude_TEST = 0.0;        // TEST ONLY
   IIR3 _LP_attitude;                  // Low-pass on _attitude_H
   IIR3 _HP_attitude;                  // High-pass on _attitude_EG
 
   // Encoder position estimate variables
-  double _prev_x_EG = 0.0;
-  double _prev_y_EG = 0.0;
-  double _current_x_EG = 0.0;
-  double _current_y_EG = 0.0;
+  double _prev_x_EG = 0.0;            // [m]
+  double _prev_y_EG = 0.0;            // [m]
+  double _current_x_EG = 0.0;         // [m]
+  double _current_y_EG = 0.0;         // [m]
+
+  // Position filter variables
+  double _x_F = 0.0;          // [m]
+  double _y_F = 0.0;          // [m]
+  IIR3 _LP_x;                 // Low-pass on _x_H
+  IIR3 _HP_x;                 // High-pass on _x_EG
+  IIR3 _LP_y;                 // Low-pass on _y_H
+  IIR3 _HP_y;                 // High-pass on _y_EG
 
   // Functions
   void encoder_increments() {
@@ -396,8 +486,8 @@ private:
 
   void gyro_increment() {
     _time_ok = compute_time_step();
-
-    if (!_time_ok || !_have_gyro) { // Check if _T_c not valid or if no gyro message
+    
+    if (!_time_ok || _first_gyro) {   // invalid T_c, or no gyro reading yet
       _delta_attitude_G = _delta_attitude_E; // Use encoder value as backup for this step
       return;
     }
@@ -421,8 +511,8 @@ private:
   }
 
   void attitude_complementary_filter() {
-    // TODO: Problems at robot init when no history / abrupt changes when values 0->input?
-    _attitude_F = _HP_attitude.step(_attitude_EG) + _LP_attitude.step(_attitude_H);
+    _prev_attitude_F = _current_attitude_F;
+    _current_attitude_F = _HP_attitude.step(_attitude_EG) + _LP_attitude.step(_attitude_H);
   }
 
   void encoder_gyro_position_estimate() {
@@ -435,7 +525,8 @@ private:
   }
 
   void position_complementary_filter() {
-    
+    _x_F = _HP_x.step(_current_x_EG) + _LP_x.step(_x_H);
+    _y_F = _HP_y.step(_current_y_EG) + _LP_y.step(_y_H);
   }
 };
 
