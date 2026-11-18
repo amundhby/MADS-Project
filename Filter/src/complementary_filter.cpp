@@ -268,6 +268,7 @@ public:
     out["encoder"]["delta_distance_R"] = _delta_s_R;
     out["encoder"]["delta_distance_E"] = _delta_s_E;
     out["encoder"]["delta_attitude_E"] = _delta_attitude_E;
+    out["encoder"]["_T_c_avg"] = _T_tot / _T_count;
 
     out["gyro"]["T_c"] = _T_c;
     out["gyro"]["delta_attitude_G"] = _delta_attitude_G;
@@ -395,6 +396,8 @@ private:
   double _prev_time = 0.0;          // [s since midnight]
   double _current_time = 0.0;       // [s since midnight]
   double _T_c = 0.0;                // [s] time since the previous driver message
+  double _T_tot = 0.0;              // [s] sum of all time steps
+  double _T_count = 0.0;            // # of valid time steps
 
   // Flags
   bool _params_ok = false;            // Set true if initial parameter as ok
@@ -486,6 +489,12 @@ private:
 
   void gyro_increment() {
     _time_ok = compute_time_step();
+
+    // Finding total T
+    if (_time_ok) {
+      _T_tot += _T_c;
+      _T_count++;
+    }
     
     if (!_time_ok || _first_gyro) {   // invalid T_c, or no gyro reading yet
       _delta_attitude_G = _delta_attitude_E; // Use encoder value as backup for this step
