@@ -475,6 +475,7 @@ private:
   bool _first_driver = true;          // True until first driver message arrived
   bool _first_htc = true;             // True until first htc message arrived
   bool _time_ok = true;               // False if _T_c not valid
+  bool _gyro_ok = false;              // True if this step's delta_attitude_G came from the gyro
   bool _filters_initialized = false;  // False until filters initialized
 
   // Parameters
@@ -616,8 +617,10 @@ private:
     double theta_now = theta_at(_current_time);
     if (!_time_ok || isnan(theta_now) || isnan(_theta_used_prev)) {   // invalid T_c, or no gyro reading yet
       _delta_attitude_G = _delta_attitude_E; // Use encoder value as backup for this step
+      _gyro_ok = false;
     } else {
       _delta_attitude_G = theta_now - _theta_used_prev;
+      _gyro_ok = true;
     }
     _theta_used_prev = theta_now;
   }
@@ -660,7 +663,7 @@ private:
     _delta_s_E = 0.0;
     _delta_attitude_E = 0.0;
 
-    if (_time_ok && !_first_gyro) {
+    if (_gyro_ok) {
       _delta_attitude_EG = _delta_attitude_G;   // trust the gyro fully
     } else {
       _delta_attitude_EG = 0.0;                 // no valid gyro either: assume no turn
