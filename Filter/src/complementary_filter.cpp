@@ -194,10 +194,15 @@ public:
       double yaw_H = atan2(H[1][0].get<double>(), H[0][0].get<double>());
       if (!isfinite(x) || !isfinite(y) || !isfinite(yaw_H)) {return return_type::retry;}
 
+      // Checking if robot lifted
+      if (H[2][3].is_number()) {
+        double z = H[2][3].get<double>();
+        if (isfinite(z)) {update_lift_detection(z);}
+      }
+
       // Updating class variables
       _x_H = x;
       _y_H = y;
-      _attitude_TEST = input["Htracker"]["pose"]["attitude"][2]; // TEST ONLY. TODO: Remove
 
       if (_first_htc) {
         _attitude_H = yaw_H;
@@ -208,6 +213,10 @@ public:
         _attitude_H += d;
       }
       _prev_yaw_H = yaw_H;
+
+      _attitude_H_pred = _attitude_H;
+      _x_H_pred = _x_H;
+      _y_H_pred = _y_H;
     }
 
     return return_type::retry; // Ignore all other topics
@@ -223,42 +232,46 @@ public:
   // return_type::error: _error is traced via register_event, don't publish
   // return_type::critical: execution stops
   return_type process(json &out, vector<unsigned char> *blob = nullptr) override {
-    // Questions:
-    // Euler angle vs. H matrix
-    // Can we ignore noise with rotation around x and y axis' when we calculate rotation around z
-    // Timer issue
-    
-    // Question for group and/or prof:
-    // Variable naming for step 7. Use ctrl + f if replacing
-
     // Testing:
     // mu and rho variables
     // validate other variables with known robot movement
-    // Find gyro bias for load_params()
 
     encoder_increments();                 // Step 1
     gyro_increment();                     // Step 2
     maneuver_weights();                   // Step 3
     encoder_gyro_attitude_fusion();       // Step 4
+    wheels_lifted_override();             // overrides steps 1 and 4 while lifted
     encoder_gyro_attitude_estimate();     // Step 5
 
-    // Start the filters once the HTC is available
-    if (!_filters_initialized) {
-      if (_first_htc) {return return_type::retry;}  // No HTC yet: don't publish
-      _HP_attitude.init(_attitude_EG);
-      _LP_attitude.init(_attitude_H);
-      _HP_x.init(_current_x_EG);
-      _LP_x.init(_x_H);
-      _HP_y.init(_current_y_EG);
-      _LP_y.init(_y_H);
-      _current_attitude_F = _attitude_H; // So the initial step 7 averages correctly
-      _filters_initialized = true;
+    if (!_filters_initialized && _first_htc) {
+      // --- Prediction mode: no HTC yet, encoders + gyro only ---
+      _prev_attitude_F = _current_attitude_F;
+      _current_attitude_F = _attitude_EG;          // replaces step 6
+      encoder_gyro_position_estimate();            // step 7
+      _x_F = _current_x_EG;                        // replaces steps 8-9
+      _y_F = _current_y_EG;
+    } else {
+      if (!_filters_initialized) {
+        // --- First HTC: reset to the HTC pose, then start the filters ---
+        _attitude_EG  = _attitude_H;
+        _current_x_EG = _x_H;
+        _current_y_EG = _y_H;
+        _HP_attitude.init(_attitude_EG);
+        _LP_attitude.init(_attitude_H);
+        _HP_x.init(_current_x_EG);
+        _LP_x.init(_x_H);
+        _HP_y.init(_current_y_EG);
+        _LP_y.init(_y_H);
+        _current_attitude_F = _attitude_H;
+        _filters_initialized = true;
+      }
+      _attitude_H_pred += _delta_attitude_EG;
+      attitude_complementary_filter();             // Step 6
+      encoder_gyro_position_estimate();            // Step 7
+      _x_H_pred += _current_x_EG - _prev_x_EG;
+      _y_H_pred += _current_y_EG - _prev_y_EG;
+      position_complementary_filter();             // Steps 8-9
     }
-
-    attitude_complementary_filter();      // Step 6
-    encoder_gyro_position_estimate();     // Step 7
-    position_complementary_filter();       // Step 8-9
-    
 
     // load the data as necessary and set the fields of the json out variable
     out.clear();
@@ -271,7 +284,7 @@ public:
     out["encoder"]["delta_distance_E"] = _delta_s_E;
     out["encoder"]["delta_attitude_E"] = _delta_attitude_E;
     out["encoder"]["T_counts"] = _T_count;
-    out["encoder"]["T_c_avg"] = _T_tot / _T_count;
+    if (_T_count > 0.0) {out["encoder"]["T_c_avg"] = _T_tot / _T_count;}
 
     out["gyro"]["T_c"] = _T_c;
     out["gyro"]["delta_attitude_G"] = _delta_attitude_G;
@@ -286,7 +299,12 @@ public:
     out["htc"]["x_H"] = _x_H;
     out["htc"]["y_H"] = _y_H;
     out["htc"]["attitude_H"] = _attitude_H;
-    out["htc"]["attitude_EULER_ANGLE_TEST"] = _attitude_TEST; // TODO: Remove
+    out["htc"]["x_H_pred"] = _x_H_pred;
+    out["htc"]["y_H_pred"] = _y_H_pred;
+    out["htc"]["attitude_H_pred"] = _attitude_H_pred;
+    out["htc"]["z_rel"] = _z_rel;
+
+    out["status"]["wheels_lifted"] = _wheels_lifted;
 
     out["filter"]["attitude_F"] = _current_attitude_F;
     out["filter"]["x_EG"] = _current_x_EG;
@@ -317,6 +335,11 @@ public:
     // more here...
     _params["gyro_bias"] = 0.0; // TODO: Tune the actual value here or .ini
     _params["s_ref"] = 0.002; // TODO: Tune the actual value here or .ini
+
+    _params["lift_enter"] = 0.20;
+    _params["lift_exit"] = 0.10;
+    _params["lift_readings"] = 3;
+    _params["ground_readings"] = 1;
   
     _params["b_hp_attitude"] = {1.0, 0.0, 0.0, 0.0}; // TODO: Replace all filter coefficients!!!
     _params["b_lp_attitude"] = {0.0, 0.0, 0.0, 0.0};
@@ -342,6 +365,11 @@ public:
     _gyro_bias = _params["gyro_bias"];
     _s_ref = _params["s_ref"];
 
+    _lift_enter = _params["lift_enter"].get<double>();
+    _lift_exit = _params["lift_exit"].get<double>();
+    _lift_readings = _params["lift_readings"].get<int>();
+    _ground_readings = _params["ground_readings"].get<int>();
+
     _HP_attitude.b = _params["b_hp_attitude"];
     _LP_attitude.b = _params["b_lp_attitude"];
     _HP_attitude.a = _params["a_attitude"];
@@ -358,6 +386,11 @@ public:
     // Sanity check for sensitive variables
     if (_wheel_radius_R <= 0 || _wheel_radius_L <= 0 || _wheel_base <= 0 || _s_ref <= 0) {
       _error = "wheel_radius, wheel_base and s_ref must be > 0";
+      _params_ok = false;
+      return;
+    }
+    if (_lift_exit >= _lift_enter || _lift_readings < 1 || _ground_readings < 1) {
+      _error = "Need lift_exit < lift_enter, and lift_readings, ground_readings >= 1";
       _params_ok = false;
       return;
     }
@@ -401,7 +434,7 @@ private:
   double _current_time = 0.0;       // [s since midnight]
   double _T_c = 0.0;                // [s] time since the previous driver message
   double _T_tot = 0.0;              // [s] sum of all time steps
-  long _T_count = 0.0;              // # of valid time steps
+  long _T_count = 0;                // # of valid time steps
 
   // Flags
   bool _params_ok = false;            // Set true if initial parameter as ok
@@ -439,6 +472,19 @@ private:
   double _q = 0.0;           // [0, 1] Indicates if the walker is moving
   double _xi_R = 0.0;        // [0, 4] Indicates trust in encoder vs. gyro
 
+  // Lift detection
+  bool   _wheels_lifted = false;   // true while the wheels are off the ground
+  bool   _have_z_floor = false;    // true once the floor height is known
+  double _z_floor = 0.0;           // [m] HTC height of the wheel midpoint on the floor
+  double _z_rel = 0.0;             // [m] current height above the floor
+  int    _lift_count = 0;          // consecutive HTC readings meeting the switch condition
+
+  // Lift detection parameters (set in set_params)
+  double _lift_enter = 0.0;       // [m] above this = lifted
+  double _lift_exit = 0.0;        // [m] below this = back on the ground
+  int    _lift_readings = 0;       // readings in a row needed to switch to lifted
+  int    _ground_readings = 0;     // readings in a row needed to switch back
+
   // Encoder-gyro fusion variables
   double _delta_attitude_EG = 0.0;      // [rad]
 
@@ -450,12 +496,14 @@ private:
   double _y_H = 0.0;                    // [m]
   double _prev_yaw_H = 0.0;             // [Rad]
   double _attitude_H = 0.0;             // [Rad] Rotation around z-axis
+  double _x_H_pred = 0.0;               // [m] Includes added prediction from encoder-gyro
+  double _y_H_pred = 0.0;               // [m] Includes added prediction from encoder-gyro
+  double _attitude_H_pred = 0.0;        // [rad] Includes added prediction from encoder-gyro
 
   // Attitude filter variables
   double _prev_attitude_F = 0.0;      // [rad]
   double _current_attitude_F = 0.0;   // [rad]
-  double _attitude_TEST = 0.0;        // TEST ONLY
-  IIR3 _LP_attitude;                  // Low-pass on _attitude_H
+  IIR3 _LP_attitude;                  // Low-pass on _attitude_H_pred
   IIR3 _HP_attitude;                  // High-pass on _attitude_EG
 
   // Encoder position estimate variables
@@ -467,9 +515,9 @@ private:
   // Position filter variables
   double _x_F = 0.0;          // [m]
   double _y_F = 0.0;          // [m]
-  IIR3 _LP_x;                 // Low-pass on _x_H
+  IIR3 _LP_x;                 // Low-pass on _x_H_pred
   IIR3 _HP_x;                 // High-pass on _x_EG
-  IIR3 _LP_y;                 // Low-pass on _y_H
+  IIR3 _LP_y;                 // Low-pass on _y_H_pred
   IIR3 _HP_y;                 // High-pass on _y_EG
 
   // Functions
@@ -520,13 +568,47 @@ private:
                         pow(_xi_R, 2) / (1 + pow(_xi_R, 2)) * _delta_attitude_G;
   }
 
+  // Lift detection from the HTC height of the wheel midpoint.
+  // Switching needs several readings in a row
+  void update_lift_detection(double z) {
+    if (!_have_z_floor) { // first reading: assume the walker starts on the floor
+      _z_floor = z;
+      _have_z_floor = true;
+      return;
+    }
+    _z_rel = fabs(z - _z_floor);
+
+    if (!_wheels_lifted) {
+      _lift_count = (_z_rel > _lift_enter) ? _lift_count + 1 : 0;
+      if (_lift_count >= _lift_readings) {_wheels_lifted = true; _lift_count = 0;}
+    } else {
+      _lift_count = (_z_rel < _lift_exit) ? _lift_count + 1 : 0;
+      if (_lift_count >= _ground_readings) {_wheels_lifted = false; _lift_count = 0;}
+    }
+  }
+
+  void wheels_lifted_override() {
+    if (!_wheels_lifted) {return;}
+
+    _delta_s_L = 0.0;
+    _delta_s_R = 0.0;
+    _delta_s_E = 0.0;
+    _delta_attitude_E = 0.0;
+
+    if (_time_ok && !_first_gyro) {
+      _delta_attitude_EG = _delta_attitude_G;   // trust the gyro fully
+    } else {
+      _delta_attitude_EG = 0.0;                 // no valid gyro either: assume no turn
+    }
+  }
+
   void encoder_gyro_attitude_estimate() {
     _attitude_EG += _delta_attitude_EG;
   }
 
   void attitude_complementary_filter() {
     _prev_attitude_F = _current_attitude_F;
-    _current_attitude_F = _HP_attitude.step(_attitude_EG) + _LP_attitude.step(_attitude_H);
+    _current_attitude_F = _HP_attitude.step(_attitude_EG) + _LP_attitude.step(_attitude_H_pred);
   }
 
   void encoder_gyro_position_estimate() {
@@ -539,8 +621,8 @@ private:
   }
 
   void position_complementary_filter() {
-    _x_F = _HP_x.step(_current_x_EG) + _LP_x.step(_x_H);
-    _y_F = _HP_y.step(_current_y_EG) + _LP_y.step(_y_H);
+    _x_F = _HP_x.step(_current_x_EG) + _LP_x.step(_x_H_pred);
+    _y_F = _HP_y.step(_current_y_EG) + _LP_y.step(_y_H_pred);
   }
 };
 
