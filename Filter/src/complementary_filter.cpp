@@ -109,6 +109,7 @@ public:
   return_type load_data(json const &input, string topic = "", vector<unsigned char> const *blob = nullptr) override {
     // Do something with the input data
     if (!_params_ok) {return return_type::critical;}
+    // cout << "Message arrived: " << topic << "\n";
     
     // --- Driver Message ---
     if (topic == "driver") {
@@ -225,6 +226,7 @@ public:
     // Questions:
     // Euler angle vs. H matrix
     // Can we ignore noise with rotation around x and y axis' when we calculate rotation around z
+    // Timer issue
     
     // Question for group and/or prof:
     // Variable naming for step 7. Use ctrl + f if replacing
@@ -268,7 +270,8 @@ public:
     out["encoder"]["delta_distance_R"] = _delta_s_R;
     out["encoder"]["delta_distance_E"] = _delta_s_E;
     out["encoder"]["delta_attitude_E"] = _delta_attitude_E;
-    out["encoder"]["_T_c_avg"] = _T_tot / _T_count;
+    out["encoder"]["T_counts"] = _T_count;
+    out["encoder"]["T_c_avg"] = _T_tot / _T_count;
 
     out["gyro"]["T_c"] = _T_c;
     out["gyro"]["delta_attitude_G"] = _delta_attitude_G;
@@ -327,13 +330,14 @@ public:
     // params needs to be cast to json
     _params.merge_patch(params);
 
-    if (!_params.contains("wheel_radius") || !_params.contains("wheel_base")) {
+    if (!_params.contains("wheel_radius_R") || !_params.contains("wheel_radius_L") || !_params.contains("wheel_base")) {
       _error = "wheel radius and wheel_base must be set in mads.ini file";
       _params_ok = false;
       return;
     }
 
-    _wheel_radius = _params["wheel_radius"];
+    _wheel_radius_R = _params["wheel_radius_R"];
+    _wheel_radius_L = _params["wheel_radius_L"];
     _wheel_base = _params["wheel_base"];
     _gyro_bias = _params["gyro_bias"];
     _s_ref = _params["s_ref"];
@@ -352,7 +356,7 @@ public:
     _LP_y = _LP_x;
 
     // Sanity check for sensitive variables
-    if (_wheel_radius <= 0 || _wheel_base <= 0 || _s_ref <= 0) {
+    if (_wheel_radius_R <= 0 || _wheel_radius_L <= 0 || _wheel_base <= 0 || _s_ref <= 0) {
       _error = "wheel_radius, wheel_base and s_ref must be > 0";
       _params_ok = false;
       return;
@@ -397,7 +401,7 @@ private:
   double _current_time = 0.0;       // [s since midnight]
   double _T_c = 0.0;                // [s] time since the previous driver message
   double _T_tot = 0.0;              // [s] sum of all time steps
-  double _T_count = 0.0;            // # of valid time steps
+  long _T_count = 0.0;              // # of valid time steps
 
   // Flags
   bool _params_ok = false;            // Set true if initial parameter as ok
@@ -408,7 +412,8 @@ private:
   bool _filters_initialized = false;  // False until filters initialized
 
   // Parameters
-  double _wheel_radius = 0.0;         // [m] Set in set_params
+  double _wheel_radius_R = 0.0;       // [m] Set in set_params
+  double _wheel_radius_L = 0.0;       // [m] Set in set_params
   double _wheel_base = 0.0;           // [m] Set in set_params
   double _gyro_bias = 0.0;            // [rad/s] Set in set_params
   const double _enc_res = 4096.0;     // [ticks] Ticks per rev
@@ -471,8 +476,8 @@ private:
   void encoder_increments() {
     int delta_enc_n_L = _current_enc_n_L - _prev_enc_n_L;
     int delta_enc_n_R = _current_enc_n_R - _prev_enc_n_R;
-    _delta_s_L = (2*M_PI*_wheel_radius) / _enc_res * delta_enc_n_L;
-    _delta_s_R = (2*M_PI*_wheel_radius) / _enc_res * delta_enc_n_R;
+    _delta_s_L = (2*M_PI*_wheel_radius_L) / _enc_res * delta_enc_n_L;
+    _delta_s_R = (2*M_PI*_wheel_radius_R) / _enc_res * delta_enc_n_R;
     _delta_s_E = (_delta_s_R + _delta_s_L) / 2;
     _delta_attitude_E = (_delta_s_R - _delta_s_L) / _wheel_base; // Sign convention: v_R > v_L
   }
