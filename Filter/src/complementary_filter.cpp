@@ -16,8 +16,9 @@
 #include <filter.hpp>
 #include <nlohmann/json.hpp>
 #include <pugg/Kernel.h>
+#include <deque>
 
-// other includes as needed here
+// Other includes as needed here
 #define _USE_MATH_DEFINES
 #include <math.h>
 #include <cstdio>
@@ -55,36 +56,11 @@ double time_diff(double t1, double t2) {
   return diff;
 }
 
-// Integrated gyro angle at time t, by interpolating between samples
-double theta_at(double time) {
-  if (_gyro_buf.empty()) { return NAN; }
-  const GyroSample &oldest_sample = _gyro_buf.front();
-  const GyroSample &newest_sample = _gyro_buf.back();
-
-  if (time_diff(time, oldest_sample.time) >= 0.0) {   // t before first sample
-    return oldest_sample.theta + oldest_sample.w * time_diff(oldest_sample.time, time);
-  }
-
-  if (time_diff(newest_sample.time, time) >= 0.0) {   // t after last sample: hold last ω
-    _gyro_extrapolation_time = time_diff(newest_sample.time, time);
-    return newest_sample.theta + newest_sample.w * _gyro_extrapolation_time;
-  }
-
-  _gyro_extrapolation_time = 0.0;
-  for (size_t i = 0; i + 1 < _gyro_buf.size(); ++i) {
-    const GyroSample &s0 = _gyro_buf[i];
-    const GyroSample &s1 = _gyro_buf[i + 1];
-
-    if (time_diff(s1.time, time) <= 0.0) {           // s0.time <= time <= s1.time
-      double h   = time_diff(s0.time, s1.time);
-      double tau = time_diff(s0.time, time);
-      double w_t = s0.w + (s1.w - s0.w) * tau / h;   // interpolated rate at t
-      return s0.theta + tau * (s0.w + w_t) / 2.0;    // trapezoid up to t
-    }
-  }
-
-  return newest_sample.theta;  // should not get here
-}
+struct GyroSample {
+  double time;  // [s]
+  double w;     // [rad/s]
+  double theta; // [rad]
+};
 
 // --- Filter ---
 // Third-order discrete IIR filter: y_k = sum_{i=0..3} b_i x_{k-i} - sum_{i=1..3} a_i y_{k-i}
@@ -488,11 +464,6 @@ private:
   double _delta_attitude_E = 0.0;   // [rad]
 
   // Gyro variables
-  struct GyroSample {
-    double time;  // [s]
-    double w;     // [rad/s]
-    double theta; // [rad]
-  };
   deque<GyroSample> _gyro_buf;           // Recent samples, oldest first
   double _theta_used_prev = NAN;         // Theta used at previous driver step [rad]
   double _gyro_extrapolation_time = 0.0; // [s] how far past the last sample we had to guess
@@ -544,6 +515,36 @@ private:
     _delta_s_R = (2*M_PI*_wheel_radius_R) / _enc_res * delta_enc_n_R;
     _delta_s_E = (_delta_s_R + _delta_s_L) / 2;
     _delta_attitude_E = (_delta_s_R - _delta_s_L) / _wheel_base; // Sign convention: v_R > v_L
+  }
+
+  double theta_at(double time) {
+    if (_gyro_buf.empty()) { return NAN; }
+    const GyroSample &oldest_sample = _gyro_buf.front();
+    const GyroSample &newest_sample = _gyro_buf.back();
+
+    if (time_diff(time, oldest_sample.time) >= 0.0) {   // t before first sample
+      return oldest_sample.theta + oldest_sample.w * time_diff(oldest_sample.time, time);
+    }
+
+    if (time_diff(newest_sample.time, time) >= 0.0) {   // t after last sample: hold last ω
+      _gyro_extrapolation_time = time_diff(newest_sample.time, time);
+      return newest_sample.theta + newest_sample.w * _gyro_extrapolation_time;
+    }
+
+    _gyro_extrapolation_time = 0.0;
+    for (size_t i = 0; i + 1 < _gyro_buf.size(); ++i) {
+      const GyroSample &s0 = _gyro_buf[i];
+      const GyroSample &s1 = _gyro_buf[i + 1];
+
+      if (time_diff(s1.time, time) <= 0.0) {           // s0.time <= time <= s1.time
+        double h   = time_diff(s0.time, s1.time);
+        double tau = time_diff(s0.time, time);
+        double w_t = s0.w + (s1.w - s0.w) * tau / h;   // interpolated rate at t
+        return s0.theta + tau * (s0.w + w_t) / 2.0;    // trapezoid up to t
+      }
+    }
+
+    return newest_sample.theta;  // should not get here
   }
 
   bool compute_time_step() {
