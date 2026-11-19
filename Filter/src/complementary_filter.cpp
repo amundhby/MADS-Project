@@ -47,6 +47,45 @@ double timestamp_to_seconds(const json &msg) {
   return h * 3600.0 + m * 60.0 + sec;
 }
 
+// Time difference b - a in seconds, robust to crossing midnight
+double time_diff(double t1, double t2) {
+  double diff = t2 - t1;
+  if (diff < -43200.0) { diff += 86400.0; }
+  if (diff >  43200.0) { diff -= 86400.0; }
+  return diff;
+}
+
+// Integrated gyro angle at time t, by interpolating between samples
+double theta_at(double time) {
+  if (_gyro_buf.empty()) { return NAN; }
+  const GyroSample &oldest_sample = _gyro_buf.front();
+  const GyroSample &newest_sample = _gyro_buf.back();
+
+  if (time_diff(time, oldest_sample.time) >= 0.0) {   // t before first sample
+    return oldest_sample.theta + oldest_sample.w * time_diff(oldest_sample.time, time);
+  }
+
+  if (time_diff(newest_sample.time, time) >= 0.0) {   // t after last sample: hold last ω
+    _gyro_extrapolation_time = time_diff(newest_sample.time, time);
+    return newest_sample.theta + newest_sample.w * _gyro_extrapolation_time;
+  }
+
+  _gyro_extrapolation_time = 0.0;
+  for (size_t i = 0; i + 1 < _gyro_buf.size(); ++i) {
+    const GyroSample &s0 = _gyro_buf[i];
+    const GyroSample &s1 = _gyro_buf[i + 1];
+
+    if (time_diff(s1.time, time) <= 0.0) {           // s0.time <= time <= s1.time
+      double h   = time_diff(s0.time, s1.time);
+      double tau = time_diff(s0.time, time);
+      double w_t = s0.w + (s1.w - s0.w) * tau / h;   // interpolated rate at t
+      return s0.theta + tau * (s0.w + w_t) / 2.0;    // trapezoid up to t
+    }
+  }
+
+  return newest_sample.theta;  // should not get here
+}
+
 // --- Filter ---
 // Third-order discrete IIR filter: y_k = sum_{i=0..3} b_i x_{k-i} - sum_{i=1..3} a_i y_{k-i}
 // x[0], y[0] are the newest values; x[3], y[3] the oldest.
@@ -168,11 +207,30 @@ public:
 
       // Loading gyro reading
       double w = input["gyro"].get<double>();
-      if (!isfinite(w)) {return return_type::retry;}
+      double t = timestamp_to_seconds(input);
+      if (!isfinite(w)) { return return_type::retry; }
+      w -= _gyro_bias;
 
-      // Updating class variables
-      _current_w_G = w;
-      _first_gyro = false;
+      if (_gyro_buf.empty()) {
+        _gyro_buf.push_back({t, w, 0.0});
+      } else {
+        const GyroSample &last_sample = _gyro_buf.back();
+        double dt = time_diff(last_sample.time, t);
+        if (dt <= 0.0) { return return_type::retry; }  // duplicate or out of order
+
+        if (dt > 1.0) {                                // gap: restart integration
+          _gyro_buf.clear();
+          _theta_used_prev = NAN;                      // next step falls back to encoder
+          _gyro_buf.push_back({t, w, 0.0});
+        } else {
+          double theta = last_sample.theta + dt * (last_sample.w + w) / 2.0; // trapezoid
+          _gyro_buf.push_back({t, w, theta});
+        }
+      }
+      // Keep about 2 s of history
+      while (_gyro_buf.size() > 2 && time_diff(_gyro_buf.front().time, t) > 2.0) {
+        _gyro_buf.pop_front();
+      }
     }
 
     // --- HTC Message ---
@@ -406,7 +464,6 @@ private:
   // Flags
   bool _params_ok = false;            // Set true if initial parameter as ok
   bool _first_driver = true;          // True until first driver message arrived
-  bool _first_gyro = true;            // True until first gyro message arrived
   bool _first_htc = true;             // True until first htc message arrived
   bool _time_ok = true;               // False if _T_c not valid
   bool _filters_initialized = false;  // False until filters initialized
@@ -431,8 +488,15 @@ private:
   double _delta_attitude_E = 0.0;   // [rad]
 
   // Gyro variables
-  double _current_w_G = 0.0;          // [rad/s]
-  double _delta_attitude_G = 0.0;     // [rad]
+  struct GyroSample {
+    double time;  // [s]
+    double w;     // [rad/s]
+    double theta; // [rad]
+  };
+  deque<GyroSample> _gyro_buf;           // Recent samples, oldest first
+  double _theta_used_prev = NAN;         // Theta used at previous driver step [rad]
+  double _gyro_extrapolation_time = 0.0; // [s] how far past the last sample we had to guess
+  double _delta_attitude_G = 0.0;        // [rad]
 
   // Manuever index variables
   double _u = 0.0;           // [0, 1] Indicates how much walker is turning
@@ -483,8 +547,7 @@ private:
   }
 
   bool compute_time_step() {
-    _T_c = _current_time - _prev_time;
-    if (_T_c < 0.0) {_T_c += 86400.0;}  // Crossed midnight: add one day in seconds
+    _T_c = time_diff(_prev_time, _current_time);
     if (_T_c <= 0.0 || _T_c > 1.0) {
       _error = "Invalid time step: " + to_string(_T_c) + " s";
       return false;
@@ -500,13 +563,14 @@ private:
       _T_tot += _T_c;
       _T_count++;
     }
-    
-    if (!_time_ok || _first_gyro) {   // invalid T_c, or no gyro reading yet
-      _delta_attitude_G = _delta_attitude_E; // Use encoder value as backup for this step
-      return;
-    }
 
-    _delta_attitude_G = _T_c * (_current_w_G - _gyro_bias);
+    double theta_now = theta_at(_current_time);
+    if (!_time_ok || isnan(theta_now) || isnan(_theta_used_prev)) {   // invalid T_c, or no gyro reading yet
+      _delta_attitude_G = _delta_attitude_E; // Use encoder value as backup for this step
+    } else {
+      _delta_attitude_G = theta_now - _theta_used_prev;
+    }
+    _theta_used_prev = theta_now;
   }
 
   void maneuver_weights() {
