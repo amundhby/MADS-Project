@@ -187,25 +187,20 @@ public:
       if (!isfinite(w)) { return return_type::retry; }
       w -= _gyro_bias;
 
-      if (_gyro_buf.empty()) {
-        _gyro_buf.push_back({t, w, 0.0});
+      if (_first_gyro) {
+        _newest_gyro = {t, w, 0.0};
+        _first_gyro = false;
       } else {
-        const GyroSample &last_sample = _gyro_buf.back();
-        double dt = time_diff(last_sample.time, t);
-        if (dt <= 0.0) { return return_type::retry; }  // duplicate or out of order
+        double dt = time_diff(_newest_gyro.time, t);
 
+        if (dt <= 0.0) { return return_type::retry; }  // duplicate or out of order
         if (dt > 1.0) {                                // gap: restart integration
-          _gyro_buf.clear();
-          _theta_used_prev = NAN;                      // next step falls back to encoder
-          _gyro_buf.push_back({t, w, 0.0});
+          _prev_attitude_G = NAN;                      // next step falls back to encoder
+          _newest_gyro = {t, w, 0.0};
         } else {
-          double theta = last_sample.theta + dt * (last_sample.w + w) / 2.0; // trapezoid
-          _gyro_buf.push_back({t, w, theta});
+          double theta = _newest_gyro.theta + dt * (_newest_gyro.w + w) / 2.0; // trapezoid
+          _newest_gyro = {t, w, theta};
         }
-      }
-      // Keep about 2 s of history
-      while (_gyro_buf.size() > 2 && time_diff(_gyro_buf.front().time, t) > 2.0) {
-        _gyro_buf.pop_front();
       }
     }
 
@@ -473,7 +468,8 @@ private:
   // Flags
   bool _params_ok = false;            // Set true if initial parameter as ok
   bool _first_driver = true;          // True until first driver message arrived
-  bool _first_htc = true;             // True until first htc message arrived
+  bool _first_gyro = true;            // True until first gyro message arrived (or after a gap)
+  bool _first_htc = true;             // True until first HTC message arrived
   bool _time_ok = true;               // False if _T_c not valid
   bool _gyro_ok = false;              // True if this step's delta_attitude_G came from the gyro
   bool _filters_initialized = false;  // False until filters initialized
@@ -498,10 +494,12 @@ private:
   double _delta_attitude_E = 0.0;   // [rad]
 
   // Gyro variables
-  deque<GyroSample> _gyro_buf;           // Recent samples, oldest first
-  double _theta_used_prev = NAN;         // Theta used at previous driver step [rad]
-  double _gyro_extrapolation_time = 0.0; // [s] how far past the last sample we had to guess
-  double _delta_attitude_G = 0.0;        // [rad]
+  GyroSample _newest_gyro;                  // [rad/s] Last gyro sample
+  double _prev_attitude_G = 0.0;            // [rad] Theta used at previous driver step
+  double _current_attitude_G = 0.0;         // [rad] Theta used at current driver step
+  double _gyro_extrapolation_time = 0.0;    // [s] How far past the newest sample we have guessed
+  const double _max_gyro_extrapolation = 1; // [s] Upper limit on extrapolation time
+  double _delta_attitude_G = 0.0;           // [rad]
 
   // Manuever index variables
   double _u = 0.0;           // [0, 1] Indicates how much walker is turning
@@ -509,44 +507,44 @@ private:
   double _xi_R = 0.0;        // [0, 4] Indicates trust in encoder vs. gyro
 
   // Lift detection
-  bool   _wheels_lifted = false;   // true while the wheels are off the ground
-  bool   _have_z_floor = false;    // true once the floor height is known
+  bool   _wheels_lifted = false;   // True while the wheels are off the ground
+  bool   _have_z_floor = false;    // True once the floor height is known
   double _z_floor = 0.0;           // [m] HTC height of the wheel midpoint on the floor
-  double _z_rel = 0.0;             // [m] current height above the floor
-  int    _lift_count = 0;          // consecutive HTC readings meeting the switch condition
+  double _z_rel = 0.0;             // [m] Current height above the floor
+  int    _lift_count = 0;          // Consecutive HTC readings meeting the switch condition
 
   // Lift detection parameters (set in set_params)
-  double _lift_enter = 0.0;       // [m] above this = lifted
-  double _lift_exit = 0.0;        // [m] below this = back on the ground
-  int    _lift_readings = 0;       // readings in a row needed to switch to lifted
-  int    _ground_readings = 0;     // readings in a row needed to switch back
+  double _lift_enter = 0.0;       // [m] Above this = lifted
+  double _lift_exit = 0.0;        // [m] Below this = back on the ground
+  int    _lift_readings = 0;      // Readings in a row needed to switch to lifted
+  int    _ground_readings = 0;    // Readings in a row needed to switch back
 
   // Encoder-gyro fusion variables
-  double _delta_attitude_EG = 0.0;      // [rad]
+  double _delta_attitude_EG = 0.0;   // [rad]
 
   // Attitude estimate variables
-  double _attitude_EG = 0.0;            // [rad]
+  double _attitude_EG = 0.0;         // [rad]
 
   // HTC variables
-  double _x_H = 0.0;                    // [m]
-  double _y_H = 0.0;                    // [m]
-  double _prev_yaw_H = 0.0;             // [Rad]
-  double _attitude_H = 0.0;             // [Rad] Rotation around z-axis
-  double _x_H_pred = 0.0;               // [m] Includes added prediction from encoder-gyro
-  double _y_H_pred = 0.0;               // [m] Includes added prediction from encoder-gyro
-  double _attitude_H_pred = 0.0;        // [rad] Includes added prediction from encoder-gyro
+  double _x_H = 0.0;                 // [m]
+  double _y_H = 0.0;                 // [m]
+  double _prev_yaw_H = 0.0;          // [Rad]
+  double _attitude_H = 0.0;          // [Rad] Rotation around z-axis
+  double _x_H_pred = 0.0;            // [m] Includes added prediction from encoder-gyro
+  double _y_H_pred = 0.0;            // [m] Includes added prediction from encoder-gyro
+  double _attitude_H_pred = 0.0;     // [rad] Includes added prediction from encoder-gyro
 
   // Attitude filter variables
-  double _prev_attitude_F = 0.0;      // [rad]
-  double _current_attitude_F = 0.0;   // [rad]
-  IIR3 _LP_attitude;                  // Low-pass on _attitude_H_pred
-  IIR3 _HP_attitude;                  // High-pass on _attitude_EG
+  double _prev_attitude_F = 0.0;     // [rad]
+  double _current_attitude_F = 0.0;  // [rad]
+  IIR3 _LP_attitude;                 // Low-pass on _attitude_H_pred
+  IIR3 _HP_attitude;                 // High-pass on _attitude_EG
 
   // Encoder position estimate variables
-  double _prev_x_EG = 0.0;            // [m]
-  double _prev_y_EG = 0.0;            // [m]
-  double _current_x_EG = 0.0;         // [m]
-  double _current_y_EG = 0.0;         // [m]
+  double _prev_x_EG = 0.0;           // [m]
+  double _prev_y_EG = 0.0;           // [m]
+  double _current_x_EG = 0.0;        // [m]
+  double _current_y_EG = 0.0;        // [m]
 
   // Position filter variables
   double _x_F = 0.0;          // [m]
@@ -566,34 +564,13 @@ private:
     _delta_attitude_E = (_delta_s_R - _delta_s_L) / _wheel_base; // Sign convention: v_R > v_L
   }
 
-  double theta_at(double time) {
-    if (_gyro_buf.empty()) { return NAN; }
-    const GyroSample &oldest_sample = _gyro_buf.front();
-    const GyroSample &newest_sample = _gyro_buf.back();
+  double attitude_G(double time) {
+    if (_first_gyro) { return NAN; }
 
-    if (time_diff(time, oldest_sample.time) >= 0.0) {   // t before first sample
-      return oldest_sample.theta + oldest_sample.w * time_diff(oldest_sample.time, time);
-    }
+    _gyro_extrapolation_time = time_diff(_newest_gyro.time, time);
+    if (fabs(_gyro_extrapolation_time) > _max_gyro_extrapolation) { return NAN; }  // Too long since newest sample
 
-    if (time_diff(newest_sample.time, time) >= 0.0) {   // t after last sample: hold last ω
-      _gyro_extrapolation_time = time_diff(newest_sample.time, time);
-      return newest_sample.theta + newest_sample.w * _gyro_extrapolation_time;
-    }
-
-    _gyro_extrapolation_time = 0.0;
-    for (size_t i = 0; i + 1 < _gyro_buf.size(); ++i) {
-      const GyroSample &s0 = _gyro_buf[i];
-      const GyroSample &s1 = _gyro_buf[i + 1];
-
-      if (time_diff(s1.time, time) <= 0.0) {           // s0.time <= time <= s1.time
-        double h   = time_diff(s0.time, s1.time);
-        double tau = time_diff(s0.time, time);
-        double w_t = s0.w + (s1.w - s0.w) * tau / h;   // interpolated rate at t
-        return s0.theta + tau * (s0.w + w_t) / 2.0;    // trapezoid up to t
-      }
-    }
-
-    return newest_sample.theta;  // should not get here
+    return _newest_gyro.theta + _newest_gyro.w * _gyro_extrapolation_time;
   }
 
   bool compute_time_step() {
@@ -614,15 +591,15 @@ private:
       _T_count++;
     }
 
-    double theta_now = theta_at(_current_time);
-    if (!_time_ok || isnan(theta_now) || isnan(_theta_used_prev)) {   // invalid T_c, or no gyro reading yet
+    _current_attitude_G = attitude_G(_current_time);
+    if (!_time_ok || isnan(_current_attitude_G) || isnan(_prev_attitude_G)) {   // invalid T_c, or no gyro reading yet
       _delta_attitude_G = _delta_attitude_E; // Use encoder value as backup for this step
       _gyro_ok = false;
     } else {
-      _delta_attitude_G = theta_now - _theta_used_prev;
+      _delta_attitude_G = _current_attitude_G - _prev_attitude_G;
       _gyro_ok = true;
     }
-    _theta_used_prev = theta_now;
+    _prev_attitude_G = _current_attitude_G;
   }
 
   void maneuver_weights() {
