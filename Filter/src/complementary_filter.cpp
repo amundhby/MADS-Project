@@ -16,7 +16,6 @@
 #include <filter.hpp>
 #include <nlohmann/json.hpp>
 #include <pugg/Kernel.h>
-#include <deque>
 
 // Other includes as needed here
 #define _USE_MATH_DEFINES
@@ -37,13 +36,16 @@ using json = nlohmann::json;
 
 // Converts a message's timestamp ("2026-10-08T08:29:55.726+0200") into
 // seconds since midnight (here 30595.726).
-// Returns -1 if the timestamp can't be read.
+// Returns NaN if the timestamp can't be read.
 double timestamp_to_seconds(const json &msg) {
+  if (!msg.contains("timestamp") || !msg["timestamp"].contains("$date") ||
+      !msg["timestamp"]["$date"].is_string()) { return NAN; }
+  
   string s = msg["timestamp"]["$date"].get<string>();
   int h, m;
   double sec;
   if (s.size() < 19 || sscanf(s.c_str() + 11, "%d:%d:%lf", &h, &m, &sec) != 3) {
-    return -1.0;
+    return NAN;
   }
   return h * 3600.0 + m * 60.0 + sec;
 }
@@ -56,10 +58,11 @@ double time_diff(double t1, double t2) {
   return diff;
 }
 
+// Connects sample time to sample
 struct GyroSample {
-  double time;  // [s]
-  double w;     // [rad/s]
-  double theta; // [rad]
+  double time;     // [s]
+  double w;        // [rad/s]
+  double attitude; // [rad]
 };
 
 // --- Filter ---
@@ -122,8 +125,7 @@ public:
   // return_type::error: _error is traced, skip process
   // return_type::critical: execution stops
   return_type load_data(json const &input, string topic = "", vector<unsigned char> const *blob = nullptr) override {
-    // Do something with the input data
-    if (!_params_ok) {return return_type::critical;}
+    if (!_params_ok) { return return_type::critical; }
     // cout << "Message arrived: " << topic << "\n";
     
     // --- Driver Message ---
@@ -132,15 +134,11 @@ public:
         _error = "Driver message without 'encoders' field";
         return return_type::error;
       }
-      if (!input.contains("timestamp")) {
-        _error = "Driver message without 'timestamp' field";
-        return return_type::error;
-      }
 
       // Loading time and encoder counts. NOTE: Only encoder increments k
       // TODO: Change only encoder counting? Update within same timestamps, etc.
       double t  = timestamp_to_seconds(input);
-      if (t < 0) {
+      if (!isfinite(t)) {
         _error = "Could not read driver timestamp";
         return return_type::error;
       }
@@ -184,6 +182,10 @@ public:
       // Loading gyro reading
       double w = input["gyro"].get<double>();
       double t = timestamp_to_seconds(input);
+      if (!isfinite(t)) {
+        _error = "Could not read gyro timestamp";
+        return return_type::error;
+      }
       if (!isfinite(w)) { return return_type::retry; }
       w -= _gyro_bias;
 
@@ -193,13 +195,13 @@ public:
       } else {
         double dt = time_diff(_newest_gyro.time, t);
 
-        if (dt <= 0.0) { return return_type::retry; }  // duplicate or out of order
-        if (dt > 1.0) {                                // gap: restart integration
-          _prev_attitude_G = NAN;                      // next step falls back to encoder
+        if (dt <= 0.0) { return return_type::retry; }  // Duplicate or out of order
+        if (dt > 1.0) {                                // Gap: restart integration
+          _prev_attitude_G = NAN;                      // Next step falls back to encoder
           _newest_gyro = {t, w, 0.0};
         } else {
-          double theta = _newest_gyro.theta + dt * (_newest_gyro.w + w) / 2.0; // trapezoid
-          _newest_gyro = {t, w, theta};
+          double attitude = _newest_gyro.attitude + dt * (_newest_gyro.w + w) / 2.0; // Trapezoid
+          _newest_gyro = {t, w, attitude};
         }
       }
     }
@@ -214,46 +216,40 @@ public:
 
       // Loading HTC readings
       const json &H = input["Htracker"]["pose"]["H"];
-      if (!H[0][3].is_number() || !H[1][3].is_number() ||
-          !H[0][0].is_number() || !H[1][0].is_number()) {
+      if (!H[0][3].is_number() || !H[1][3].is_number() || !H[0][0].is_number() || 
+          !H[1][0].is_number() || !H[2][3].is_number()) {
         return return_type::retry;
       }
       double x = H[0][3].get<double>();
       double y = H[1][3].get<double>();
+      double z = H[2][3].get<double>();
       double yaw_H = atan2(H[1][0].get<double>(), H[0][0].get<double>());
-      if (!isfinite(x) || !isfinite(y) || !isfinite(yaw_H)) {return return_type::retry;}
-
-      // Checking if robot lifted
-      if (H[2][3].is_number()) {
-        double z = H[2][3].get<double>();
-        if (isfinite(z)) {update_lift_detection(z);}
+      if (!isfinite(x) || !isfinite(y) || !isfinite(z) || !isfinite(yaw_H)) {
+        return return_type::retry;
       }
-
-      // Updating class variables
-      _x_H = x;
-      _y_H = y;
 
       if (_first_htc) {
-        _attitude_H = yaw_H;
+        _attitude_H_pred = yaw_H;
+        _z_floor = z;
         _first_htc = false;
       } else {
-        double d = yaw_H - _prev_yaw_H;
+        double d = yaw_H - _attitude_H_pred;
         d = atan2(sin(d), cos(d));  // wrap the change into [-pi, pi]
-        _attitude_H += d;
+        _attitude_H_pred += d;
       }
-      _prev_yaw_H = yaw_H;
 
-      _attitude_H_pred = _attitude_H;
-      _x_H_pred = _x_H;
-      _y_H_pred = _y_H;
+      // Checking if robot lifted
+      update_lift_detection(z);
+
+      // Updating class variables
+      _x_H_pred = x;
+      _y_H_pred = y;
     }
 
     return return_type::retry; // Ignore all other topics
   }
 
 
-  // We calculate the average of the last N values for each key and store it
-  // into the output json object
   // Return types:
   // return_type::success: result is published
   // return_type::retry: don't publish, go to next loop
@@ -272,7 +268,7 @@ public:
     wheels_lifted_override();             // overrides steps 1 and 4 while lifted
     encoder_gyro_attitude_estimate();     // Step 5
 
-    if (!_filters_initialized && _first_htc) {
+    if (_first_htc) {
       // --- Prediction mode: no HTC yet, encoders + gyro only ---
       _prev_attitude_F = _current_attitude_F;
       _current_attitude_F = _attitude_EG;          // replaces step 6
@@ -282,16 +278,16 @@ public:
     } else {
       if (!_filters_initialized) {
         // --- First HTC: reset to the HTC pose, then start the filters ---
-        _attitude_EG  = _attitude_H;
-        _current_x_EG = _x_H;
-        _current_y_EG = _y_H;
+        _attitude_EG  = _attitude_H_pred;
+        _current_x_EG = _x_H_pred;
+        _current_y_EG = _y_H_pred;
         _HP_attitude.init(_attitude_EG);
-        _LP_attitude.init(_attitude_H);
+        _LP_attitude.init(_attitude_H_pred);
         _HP_x.init(_current_x_EG);
-        _LP_x.init(_x_H);
+        _LP_x.init(_x_H_pred);
         _HP_y.init(_current_y_EG);
-        _LP_y.init(_y_H);
-        _current_attitude_F = _attitude_H;
+        _LP_y.init(_y_H_pred);
+        _current_attitude_F = _attitude_H_pred;
         _filters_initialized = true;
       }
       _attitude_H_pred += _delta_attitude_EG;
@@ -316,6 +312,7 @@ public:
     if (_T_count > 0.0) {out["encoder"]["T_c_avg"] = _T_tot / _T_count;}
 
     out["gyro"]["T_c"] = _T_c;
+    out["gyro"]["gyro_extrapolation_time"] = _gyro_extrapolation_time;
     out["gyro"]["delta_attitude_G"] = _delta_attitude_G;
 
     out["maneuver"]["u"] = _u;
@@ -325,15 +322,14 @@ public:
     out["fusion"]["delta_attitude_EG"] = _delta_attitude_EG;
     out["fusion"]["attitude_EG"] = _attitude_EG;
 
-    out["htc"]["x_H"] = _x_H;
-    out["htc"]["y_H"] = _y_H;
-    out["htc"]["attitude_H"] = _attitude_H;
     out["htc"]["x_H_pred"] = _x_H_pred;
     out["htc"]["y_H_pred"] = _y_H_pred;
     out["htc"]["attitude_H_pred"] = _attitude_H_pred;
     out["htc"]["z_rel"] = _z_rel;
 
     out["status"]["wheels_lifted"] = _wheels_lifted;
+    out["status"]["filters_initialized"] = _filters_initialized;
+    out["status"]["gyro_ok"] = _gyro_ok;
 
     out["filter"]["attitude_F"] = _current_attitude_F;
     out["filter"]["x_EG"] = _current_x_EG;
@@ -361,20 +357,20 @@ public:
 
     // provide sensible defaults for the parameters by setting e.g.
     // _params["some_field"] = "default_value";
-    // more here...
-    _params["gyro_bias"] = 0.0; // TODO: Tune the actual value here or .ini
-    _params["s_ref"] = 0.002; // TODO: Tune the actual value here or .ini
+    _params["gyro_bias"] = 0.0;
+    _params["max_gyro_extrapolation"] = 0.1;
+    _params["s_ref"] = 0.001; // TODO: Tune the actual value here or .ini
 
     _params["lift_enter"] = 0.20;
     _params["lift_exit"] = 0.10;
     _params["lift_readings"] = 3;
     _params["ground_readings"] = 1;
   
-    _params["b_hp_attitude"] = {1.0, 0.0, 0.0, 0.0}; // TODO: Replace all filter coefficients!!!
+    _params["b_hp_attitude"] = {1.0, 0.0, 0.0, 0.0};
     _params["b_lp_attitude"] = {0.0, 0.0, 0.0, 0.0};
     _params["a_attitude"] = {1.0, 0.0, 0.0, 0.0};
 
-    _params["b_hp_position"] = {1.0, 0.0, 0.0, 0.0}; // TODO: Replace
+    _params["b_hp_position"] = {1.0, 0.0, 0.0, 0.0};
     _params["b_lp_position"] = {0.0, 0.0, 0.0, 0.0};
     _params["a_position"]    = {1.0, 0.0, 0.0, 0.0};
 
@@ -382,7 +378,8 @@ public:
     // params needs to be cast to json
     _params.merge_patch(params);
 
-    if (!_params.contains("wheel_radius_R") || !_params.contains("wheel_radius_L") || !_params.contains("wheel_base")) {
+    if (!_params.contains("wheel_radius_R") || !_params.contains("wheel_radius_L") ||
+        !_params.contains("wheel_base")) {
       _error = "wheel radius and wheel_base must be set in mads.ini file";
       _params_ok = false;
       return;
@@ -414,8 +411,9 @@ public:
     _LP_y = _LP_x;
 
     // Sanity check for sensitive variables
-    if (_wheel_radius_R <= 0 || _wheel_radius_L <= 0 || _wheel_base <= 0 || _s_ref <= 0) {
-      _error = "wheel_radius, wheel_base and s_ref must be > 0";
+    if (_wheel_radius_R <= 0 || _wheel_radius_L <= 0 || _wheel_base <= 0 || _s_ref <= 0 ||
+        _max_gyro_extrapolation <= 0) {
+      _error = "wheel_radius, wheel_base, max_gyro_extrapolation and s_ref must be > 0";
       _params_ok = false;
       return;
     }
@@ -464,12 +462,12 @@ private:
   double _current_time = 0.0;       // [s since midnight]
   double _T_c = 0.0;                // [s] time since the previous driver message
   double _T_tot = 0.0;              // [s] sum of all time steps
-  long _T_count = 0;                // # of valid time steps
+  long _T_count = 0;                // Number of valid time steps
 
   // Flags
   bool _params_ok = false;            // Set true if initial parameter as ok
   bool _first_driver = true;          // True until first driver message arrived
-  bool _first_gyro = true;            // True until first gyro message arrived (or after a gap)
+  bool _first_gyro = true;            // True until first gyro message arrived
   bool _first_htc = true;             // True until first HTC message arrived
   bool _time_ok = true;               // False if _T_c not valid
   bool _gyro_ok = false;              // True if this step's delta_attitude_G came from the gyro
@@ -495,9 +493,9 @@ private:
   double _delta_attitude_E = 0.0;   // [rad]
 
   // Gyro variables
-  GyroSample _newest_gyro;               // [rad/s] Last gyro sample
-  double _prev_attitude_G = 0.0;         // [rad] Theta used at previous driver step
-  double _current_attitude_G = 0.0;      // [rad] Theta used at current driver step
+  GyroSample _newest_gyro{};             // Last gyro sample
+  double _prev_attitude_G = NAN;         // [rad] Gyro attitude used at previous driver step
+  double _current_attitude_G = NAN;      // [rad] Gyro attitude used at current driver step
   double _gyro_extrapolation_time = 0.0; // [s] How far past the newest sample we have guessed
   double _max_gyro_extrapolation = 0.0;  // [s] Upper limit on extrapolation time
   double _delta_attitude_G = 0.0;        // [rad]
@@ -509,7 +507,6 @@ private:
 
   // Lift detection
   bool   _wheels_lifted = false;   // True while the wheels are off the ground
-  bool   _have_z_floor = false;    // True once the floor height is known
   double _z_floor = 0.0;           // [m] HTC height of the wheel midpoint on the floor
   double _z_rel = 0.0;             // [m] Current height above the floor
   int    _lift_count = 0;          // Consecutive HTC readings meeting the switch condition
@@ -527,13 +524,9 @@ private:
   double _attitude_EG = 0.0;         // [rad]
 
   // HTC variables
-  double _x_H = 0.0;                 // [m]
-  double _y_H = 0.0;                 // [m]
-  double _prev_yaw_H = 0.0;          // [Rad]
-  double _attitude_H = 0.0;          // [Rad] Rotation around z-axis
   double _x_H_pred = 0.0;            // [m] Includes added prediction from encoder-gyro
   double _y_H_pred = 0.0;            // [m] Includes added prediction from encoder-gyro
-  double _attitude_H_pred = 0.0;     // [rad] Includes added prediction from encoder-gyro
+  double _attitude_H_pred = 0.0;     // [rad] Z-axis rotation with prediction from encoder-gyro
 
   // Attitude filter variables
   double _prev_attitude_F = 0.0;     // [rad]
@@ -571,7 +564,7 @@ private:
     _gyro_extrapolation_time = time_diff(_newest_gyro.time, time);
     if (fabs(_gyro_extrapolation_time) > _max_gyro_extrapolation) { return NAN; }  // Too long since newest sample
 
-    return _newest_gyro.theta + _newest_gyro.w * _gyro_extrapolation_time;
+    return _newest_gyro.attitude + _newest_gyro.w * _gyro_extrapolation_time;
   }
 
   bool compute_time_step() {
@@ -617,11 +610,6 @@ private:
   // Lift detection from the HTC height of the wheel midpoint.
   // Switching needs several readings in a row
   void update_lift_detection(double z) {
-    if (!_have_z_floor) { // first reading: assume the walker starts on the floor
-      _z_floor = z;
-      _have_z_floor = true;
-      return;
-    }
     _z_rel = fabs(z - _z_floor);
 
     if (!_wheels_lifted) {
@@ -673,26 +661,13 @@ private:
 };
 
 
-/*
-  ____  _             _             _      _
- |  _ \| |_   _  __ _(_)_ __     __| |_ __(_)_   _____ _ __
- | |_) | | | | |/ _` | | '_ \   / _` | '__| \ \ / / _ \ '__|
- |  __/| | |_| | (_| | | | | | | (_| | |  | |\ V /  __/ |
- |_|   |_|\__,_|\__, |_|_| |_|  \__,_|_|  |_| \_/ \___|_|
-                |___/
-Enable the class as plugin
-*/
+
+
+
+// Enable the class as plugin
 MADS_REGISTER_PLUGINS(Complementary_filterPlugin);
 
 
-/*
-                  _       
-  _ __ ___   __ _(_)_ __  
- | '_ ` _ \ / _` | | '_ \ 
- | | | | | | (_| | | | | |
- |_| |_| |_|\__,_|_|_| |_|
-                          
-*/
 
 int main(int argc, char const *argv[])
 {
