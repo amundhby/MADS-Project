@@ -392,6 +392,7 @@ public:
     _wheel_radius_L = _params["wheel_radius_L"];
     _wheel_base = _params["wheel_base"];
     _gyro_bias = _params["gyro_bias"];
+    _max_gyro_extrapolation = _params["max_gyro_extrapolation"];
     _s_ref = _params["s_ref"];
 
     _lift_enter = _params["lift_enter"].get<double>();
@@ -494,12 +495,12 @@ private:
   double _delta_attitude_E = 0.0;   // [rad]
 
   // Gyro variables
-  GyroSample _newest_gyro;                  // [rad/s] Last gyro sample
-  double _prev_attitude_G = 0.0;            // [rad] Theta used at previous driver step
-  double _current_attitude_G = 0.0;         // [rad] Theta used at current driver step
-  double _gyro_extrapolation_time = 0.0;    // [s] How far past the newest sample we have guessed
-  const double _max_gyro_extrapolation = 1; // [s] Upper limit on extrapolation time
-  double _delta_attitude_G = 0.0;           // [rad]
+  GyroSample _newest_gyro;               // [rad/s] Last gyro sample
+  double _prev_attitude_G = 0.0;         // [rad] Theta used at previous driver step
+  double _current_attitude_G = 0.0;      // [rad] Theta used at current driver step
+  double _gyro_extrapolation_time = 0.0; // [s] How far past the newest sample we have guessed
+  double _max_gyro_extrapolation = 0.0;  // [s] Upper limit on extrapolation time
+  double _delta_attitude_G = 0.0;        // [rad]
 
   // Manuever index variables
   double _u = 0.0;           // [0, 1] Indicates how much walker is turning
